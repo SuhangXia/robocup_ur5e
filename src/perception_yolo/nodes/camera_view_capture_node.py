@@ -142,7 +142,9 @@ class CameraViewCapture:
             # #endregion agent log
             return
 
-        now = rospy.Time.now().to_sec()
+        # 当前 ROS 时间（通常在 Gazebo 中为仿真时间）
+        now_time = rospy.Time.now()
+        now = now_time.to_sec()
         if now - self.last_save_time < self.save_interval:
             # #region agent log
             _debug_log("H5", "camera_view_capture_node.py:callback", "skip_save_interval", {
@@ -152,10 +154,15 @@ class CameraViewCapture:
             # #endregion agent log
             return
 
-        filename = os.path.join(self.save_dir, f"camera_view_{int(now*1000)}.jpg")
+        # 图像对应的时间戳：优先使用消息头中的时间（Gazebo 仿真时间）
+        sim_stamp = getattr(msg, "header", None).stamp if hasattr(msg, "header") else now_time
+        sim_time = sim_stamp.to_sec()
+
+        filename = os.path.join(self.save_dir, f"camera_view_{int(sim_time*1000)}.jpg")
         cv2.imwrite(filename, frame)
         self.last_save_time = now
-        rospy.loginfo("已保存图像: %s", filename)
+        rospy.loginfo("已保存图像: %s | sim_time=%.3f (sec=%d, nsec=%d)",
+                      filename, sim_time, sim_stamp.secs, sim_stamp.nsecs)
         # #region agent log
         _debug_log("H6", "camera_view_capture_node.py:callback", "saved_image", {"filename": filename})
         # #endregion agent log
