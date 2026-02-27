@@ -1,0 +1,52 @@
+# ACO+RRT* 混合规划器配置
+
+# 点云话题（3D点云输入）
+pointcloud_topic: "/camera/depth/points"
+
+# 机械臂站位（与 Gazebo arm_gazebo 相同: x=-0.10, y=0, z=0.615）
+robot_base_pose:
+  x: -0.10
+  y: 0.0
+  z: 0.615
+
+# 点云转障碍物：体素分辨率 (m)，点云下采样后的体素大小
+voxel_resolution: 0.05
+
+# 工作空间边界 [x_min, x_max], [y_min, y_max], [z_min, z_max]
+workspace_bounds:
+  x: [-0.5, 1.0]
+  y: [-0.5, 0.5]
+  z: [0.0, 0.8]
+workspace_x: [-0.5, 1.0]
+workspace_y: [-0.5, 0.5]
+workspace_z: [0.0, 0.8]
+
+# ACO 参数
+aco:
+  grid_resolution: 0.02
+  n_ants: 140
+  n_iterations: 60
+  evaporation_rate: 0.5
+  pheromone_weight: 1.0
+
+# RRT* 参数
+rrt_star:
+  step_size: 0.12
+  max_iterations: 4000
+  goal_bias: 0.08
+
+# 起点与终点关节角 (弧度)
+home_joints: [0, -1.5708, 0, -1.5708, 0, 0]
+# goal_joints 留空时，由 virtual_grasp_point 通过 IK 计算
+goal_joints: null
+
+# 虚拟抓取点：作为路径规划的终点（通过 IK 计算目标关节角）
+# 与点云障碍物协同：点云全部转为障碍物 + 虚拟抓取点作为目标进行规划
+# 格式: [x, y, z] 米，base_link 系
+virtual_grasp_point: [0.68, 0.0, 0.55]
+# 无点云时的备用：为 true 时，用 Gazebo 默认障碍物（箱子+地面）仍可规划
+use_virtual_grasp_only: true
+# 是否发布 /joint_states：与 arm_gazebo 同跑时设为 false，避免 TF_REPEATED_DATA
+publish_joint_state: false
+# 规划完成后保存 Matplotlib PNG（RViz 替代方案）
+save_matplotlib_viz: true

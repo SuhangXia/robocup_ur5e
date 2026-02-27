@@ -37,7 +37,7 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "3️⃣  ROS 节点状态（如果 roscore 运行中）："
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ros_nodes=$(docker-compose exec -T brain bash -c "source /workspace/devel/setup.bash && timeout 3 rosnode list 2>/dev/null" 2>/dev/null)
+ros_nodes=$(docker-compose exec -T robocup_brain bash -c "source /workspace/devel/setup.bash && timeout 3 rosnode list 2>/dev/null" 2>/dev/null)
 if [ -n "$ros_nodes" ]; then
     echo "$ros_nodes" | while read node; do
         echo "  ✅ $node"
@@ -52,7 +52,7 @@ echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "4️⃣  ROS 话题（如果 roscore 运行中）："
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-ros_topics=$(docker-compose exec -T brain bash -c "source /workspace/devel/setup.bash && timeout 3 rostopic list 2>/dev/null" 2>/dev/null)
+ros_topics=$(docker-compose exec -T robocup_brain bash -c "source /workspace/devel/setup.bash && timeout 3 rostopic list 2>/dev/null" 2>/dev/null)
 if [ -n "$ros_topics" ]; then
     echo "$ros_topics" | while read topic; do
         echo "  ✅ $topic"
@@ -68,7 +68,7 @@ echo "📝 常用命令："
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  查看实时日志:     docker-compose logs -f"
 echo "  查看单个服务:     docker-compose logs -f brain"
-echo "  进入容器调试:     docker-compose exec brain bash"
+echo "  进入容器调试:     docker-compose exec robocup_brain bash"
 echo "  重启服务:         docker-compose restart brain"
 echo "  停止所有:         docker-compose down"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

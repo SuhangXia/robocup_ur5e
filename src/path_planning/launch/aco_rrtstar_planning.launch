@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- 加载规划配置（含 virtual_grasp_point, use_virtual_grasp_only 等） -->
+  <rosparam command="load" file="$(find path_planning)/config/planning_config.yaml" ns="aco_rrtstar_planner" />
+
+  <!-- 点云话题 -->
+  <arg name="pointcloud_topic" default="/camera/depth/points" />
+  <arg name="use_rviz" default="true" />
+
+  <!-- 规划节点 -->
+  <node name="aco_rrtstar_planner" pkg="path_planning" type="aco_rrtstar_planner_node.py" output="screen">
+    <param name="pointcloud_topic" value="$(arg pointcloud_topic)" />
+    <param name="voxel_resolution" value="0.05" />
+    <param name="frame_id" value="base_link" />
+    <param name="workspace_x" value="[-0.5, 1.0]" />
+    <param name="workspace_y" value="[-0.5, 0.5]" />
+    <param name="workspace_z" value="[0.0, 0.8]" />
+  </node>
+
+  <!-- RViz：需先运行 roslaunch ur5e_moveit_config demo.launch 以获取 robot_state_publisher -->
+  <node if="$(arg use_rviz)" name="rviz_path_planning" pkg="rviz" type="rviz"
+        args="-d $(find path_planning)/config/path_planning.rviz" />
+</launch>

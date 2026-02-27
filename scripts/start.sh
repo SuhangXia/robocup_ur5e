@@ -33,31 +33,55 @@ fi
 echo -n "  ⏳ 检查 .env 配置..."
 if [ -f ".env" ]; then
     echo " ✅"
+    set -a
+    source .env 2>/dev/null || true
+    set +a
 else
     echo " ⚠️  创建默认配置..."
     cat > .env << 'ENVFILE'
-# ROS Master 配置（指向 VirtualBox VM）
-ROS_MASTER_URI=http://192.168.56.101:11311
-ROS_IP=192.168.56.1
+# 本地 arm_gazebo Docker 模式
+ROS_MASTER_URI=http://127.0.0.1:11311
+ROS_IP=127.0.0.1
 
 # NVIDIA GPU 配置
 NVIDIA_VISIBLE_DEVICES=all
 NVIDIA_DRIVER_CAPABILITIES=compute,utility
 ENVFILE
     echo " ✅ 已创建"
+    source .env 2>/dev/null || true
 fi
 
-echo -n "  ⏳ 检查 VirtualBox VM 连接..."
-if ping -c 1 -W 2 192.168.56.101 > /dev/null 2>&1; then
-    echo " ✅"
+# 若使用 localhost（本地 arm_gazebo Docker），检查本机 11311 端口
+_ros_master_uri="${ROS_MASTER_URI:-}"
+if echo "$_ros_master_uri" | grep -q "127.0.0.1\|localhost"; then
+    echo -n "  ⏳ 检查本地 ROS Master (localhost:11311)..."
+    _port_ok=0
+    if (echo >/dev/tcp/127.0.0.1/11311) 2>/dev/null; then _port_ok=1; fi
+    if [ $_port_ok -eq 0 ] && command -v nc >/dev/null 2>&1 && nc -z 127.0.0.1 11311 2>/dev/null; then _port_ok=1; fi
+    if [ $_port_ok -eq 1 ]; then
+        echo " ✅"
+    else
+        echo " ⚠️  未检测到 roscore"
+        echo ""
+        echo "  请先启动 arm_gazebo 环境："
+        echo "    cd arm_gazebo/docker && sudo ./run.bash"
+        echo "  等待 Gazebo 和 roscore 启动后再运行本脚本。"
+        echo ""
+    fi
 else
-    echo " ⚠️  警告：无法连接到 VM"
-    echo ""
-    echo "  请确保："
-    echo "    1. VirtualBox VM 已启动"
-    echo "    2. VM IP 地址为 192.168.56.101"
-    echo "    3. VM 中运行了 roscore"
-    echo ""
+    echo -n "  ⏳ 检查 VirtualBox VM 连接..."
+    vm_ip=$(echo "${ROS_MASTER_URI}" | sed -n 's|http://\([^:]*\):.*|\1|p')
+    if [ -n "$vm_ip" ] && ping -c 1 -W 2 "$vm_ip" > /dev/null 2>&1; then
+        echo " ✅"
+    else
+        echo " ⚠️  警告：无法连接到 VM ($vm_ip)"
+        echo ""
+        echo "  请确保："
+        echo "    1. VirtualBox VM 已启动"
+        echo "    2. .env 中 ROS_MASTER_URI 指向正确的 VM IP"
+        echo "    3. VM 中运行了 roscore"
+        echo ""
+    fi
 fi
 
 cat << 'EOF'
@@ -92,7 +116,7 @@ do
             echo "  docker-compose logs -f"
             echo ""
             echo "测试 ROS 连接："
-            echo "  docker-compose exec brain bash -c 'source /workspace/devel/setup.bash && rostopic list'"
+            echo "  docker-compose exec robocup_brain bash -c 'source /workspace/devel/setup.bash && rostopic list'"
             echo ""
             echo "停止系统："
             echo "  docker-compose down"
