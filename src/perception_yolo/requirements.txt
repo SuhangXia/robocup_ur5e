@@ -6,6 +6,8 @@ torchvision==0.19.1
 ultralytics==8.3.0
 opencv-python==4.10.0.84
 numpy==1.24.4
+importlib-metadata>=6.0.0
+setuptools>=65.5.0
 
 # ROS Python 依赖
 rospkg

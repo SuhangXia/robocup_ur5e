@@ -42,9 +42,11 @@ services:
       - DISPLAY=${DISPLAY}
     volumes:
       - ./src/common_msgs:/workspace/src/common_msgs:ro
-      - ./src/perception_yolo:/workspace/src/perception_yolo:ro
+      - ./src/perception_yolo:/workspace/src/perception_yolo:rw
       - ./scripts:/workspace/scripts:ro  # 系统脚本
-      - ./models:/workspace/models:rw  # 模型目录
+      - ./weights:/workspace/weights:rw  # 权重目录
+      - /home/liufazhan/pics:/workspace/pics:rw  # 图片输出目录
+      - ./.cursor:/home/liufazhan/robocup_ur5e/.cursor:rw  # debug 日志挂载
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
     deploy:
       resources:
@@ -54,6 +56,33 @@ services:
               count: 1
               capabilities: [gpu]
     restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  # ============================================================================
+  # Perception YOLO GPU (ROSBridge + PyTorch nightly)
+  # ============================================================================
+  perception_yolo_gpu:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.yolo_gpu
+    image: robocup_ur5e/perception_yolo_gpu:latest
+    container_name: perception_yolo_gpu
+    network_mode: "host"
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    volumes:
+      - ./weights:/workspace/weights:rw
+      - ./scripts:/workspace/scripts:rw
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     stdin_open: true
     tty: true
 

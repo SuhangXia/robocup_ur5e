@@ -1,0 +1,35 @@
+# ============================================================================
+# GPU Inference Container (Python 3.10 + PyTorch nightly CUDA 12.4)
+# ============================================================================
+FROM nvidia/cuda:12.3.2-cudnn9-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Asia/Shanghai
+
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3.10-dev \
+    python3-pip \
+    git \
+    curl \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3.10 -m pip install --upgrade pip setuptools wheel
+
+# PyTorch nightly with CUDA 12.4 (for sm_120)
+RUN python3.10 -m pip install --pre \
+    torch==2.7.0.dev20250310+cu124 \
+    --index-url https://download.pytorch.org/whl/nightly/cu124
+
+# Runtime deps
+RUN python3.10 -m pip install \
+    ultralytics \
+    opencv-python \
+    numpy \
+    roslibpy
+
+WORKDIR /workspace
+
+ENTRYPOINT ["/bin/bash"]
