@@ -117,7 +117,7 @@ class MotionControlNode:
             queue_size=1
         )
         
-        # Simple command interface
+        # Simple command interface 
         from std_msgs.msg import String
         self.motion_command_sub = rospy.Subscriber(
             '/motion_command_trigger',
