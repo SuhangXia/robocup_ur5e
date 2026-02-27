@@ -1,0 +1,7 @@
+<?xml version="1.0"?>
+<launch>
+  <node name="pointcloud_processor" pkg="perception_yolo" type="pointcloud_processor_node.py" output="screen">
+    <remap from="/camera/depth/points" to="/camera/depth/points" />
+    <remap from="/camera/rgb/image_raw" to="/camera/rgb/image_raw" />
+  </node>
+</launch>

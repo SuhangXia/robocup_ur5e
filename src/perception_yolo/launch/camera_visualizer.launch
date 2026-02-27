@@ -1,0 +1,8 @@
+<?xml version="1.0"?>
+<launch>
+  <node name="camera_visualizer" pkg="perception_yolo" type="camera_visualizer_node.py" output="screen">
+    <remap from="/camera/rgb/image_raw" to="/camera/rgb/image_raw" />
+    <remap from="/camera/depth/image_raw" to="/camera/depth/image_raw" />
+    <remap from="/camera/depth/points" to="/camera/depth/points" />
+  </node>
+</launch>

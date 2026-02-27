@@ -26,7 +26,7 @@ class YOLODetectorNode:
         self.device = self._setup_device()
         
         # 参数配置
-        self.model_path = rospy.get_param('~model_path', 'yolov8n.pt')
+        self.model_path = rospy.get_param('~model_path', '/workspace/weights/yolo/yolov8n.pt')
         self.confidence_threshold = rospy.get_param('~confidence_threshold', 0.5)
         self.image_topic = rospy.get_param('~image_topic', '/camera/color/image_raw')
         

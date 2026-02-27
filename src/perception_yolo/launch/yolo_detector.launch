@@ -1,8 +1,8 @@
 <?xml version="1.0"?>
 <launch>
-  <arg name="model_path" default="yolov8n.pt" />
+  <arg name="model_path" default="/workspace/weights/yolo/yolov8n.pt" />
   <arg name="confidence_threshold" default="0.5" />
-  <arg name="image_topic" default="/camera/color/image_raw" />
+  <arg name="image_topic" default="/camera/rgb/image_raw" />
   
   <node name="yolo_detector" pkg="perception_yolo" type="yolo_detector_node.py" output="screen">
     <param name="model_path" value="$(arg model_path)" />
