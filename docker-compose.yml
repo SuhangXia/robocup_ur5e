@@ -1,5 +1,4 @@
-version: '3.8'
-
+# version 已废弃，Docker Compose V2 不再需要
 services:
   # ============================================================================
   # RoboCup Brain (Suhang's Decision Node)
@@ -117,6 +116,31 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    restart: unless-stopped
+    stdin_open: true
+    tty: true
+
+  # ============================================================================
+  # Path Planning (Sarvin & Chang - ACO+RRT* 混合规划)
+  # ============================================================================
+  path_planning:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.path_planning
+    image: robocup_ur5e/path_planning:latest
+    container_name: path_planning
+    network_mode: "host"
+    environment:
+      - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
+      - ROS_IP=${ROS_IP:-127.0.0.1}
+      - DISPLAY=${DISPLAY:-:0}
+      - QT_X11_NO_MITSHM=1
+    volumes:
+      - ./src/common_msgs:/workspace/src/common_msgs:ro
+      - ./src/path_planning:/workspace/src/path_planning:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./path_planning_viz:/workspace/viz_output:rw
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
     restart: unless-stopped
     stdin_open: true
     tty: true

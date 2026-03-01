@@ -40,6 +40,10 @@ devel_isolated/
 
 # Docker
 .dockerignore
+.env
+
+# Path planning Matplotlib 输出
+path_planning_viz/
 
 # ============================================
 # Model Weights & Checkpoints

@@ -291,6 +291,34 @@ The team uses a **VirtualBox VM** that contains:
 - **Docker containers** on your machine communicate with VM over network
 - This allows **distributed development** - everyone works on their own machine
 
+### 使用本地 arm_gazebo Docker（同机 Gazebo + RoboCup）
+
+若你在本机用 **arm_gazebo** 的 Docker 跑 Gazebo 和 roscore，而不是连 VirtualBox VM，请按以下方式配置：
+
+1. **启动顺序**（必须先生效环境 Docker，再启动 RoboCup）：
+   ```bash
+   # 终端 1：先启动 arm_gazebo 环境（含 roscore / Gazebo）
+   cd arm_gazebo/docker
+   sudo ./run.bash
+   # 等待 Gazebo 和 roscore 完全起来后再进行下一步
+
+   # 终端 2：再启动 RoboCup 总 Docker 及子容器
+   cd robocup_ur5e
+   ./scripts/start.sh
+   # 选择 1 启动所有服务
+   ```
+
+2. **`.env` 配置**：  
+   确保 RoboCup 指向本机 ROS Master（与 arm_gazebo 同机）：
+   ```bash
+   ROS_MASTER_URI=http://127.0.0.1:11311
+   ROS_IP=127.0.0.1
+   ```
+   项目根目录下的 `.env` 已默认包含上述“本地 arm_gazebo”配置；若曾改为 VM 的 IP，请改回上述两行。
+
+3. **为何能连上**：  
+   arm_gazebo 与 robocup_ur5e 的 compose 均使用 `network_mode: "host"`，roscore 在宿主机 `localhost:11311`，故 RoboCup 容器通过 `127.0.0.1:11311` 即可连接。
+
 ---
 
 ## 🎯 First-Time Setup
@@ -502,6 +530,28 @@ docker-compose build --no-cache
 ```
 
 See `BUILD_FIX_FINAL.md` for specific dependency fixes.
+
+---
+
+### Problem: 机械臂乱动导致 Gazebo 中物品飞出
+
+**现象**：运行 arm_gazebo 时机械臂乱甩，环境中物品被撞飞。
+
+**已做优化**（arm_gazebo 配置）：
+- 物理：`real_time_update_rate` 从 1000 降至 500，增加 `max_contacts`
+- 控制器：`goal_time` 从 0.6s 增至 1.0s，关节约束放宽
+
+**进一步排查**：
+```bash
+# 1. 确认是否有节点在向机械臂发命令
+rostopic echo /pos_joint_traj_controller/command
+
+# 2. 单独测试：只启动 arm_gazebo，不启动 RoboCup
+# 若单独 arm_gazebo 时稳定，问题可能在 RoboCup 侧
+
+# 3. 若仍不稳定，可进一步降低 physics 的 real_time_update_rate（如 250）
+# 编辑 arm_gazebo/worlds/arm_empty.world
+```
 
 ---
 
