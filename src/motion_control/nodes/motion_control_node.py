@@ -18,6 +18,8 @@ from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
 from common_msgs.msg import MotionCommand, GraspResult
+from moveit_msgs.srv import GetPositionIK
+from moveit_msgs.msg import PositionIKRequest, RobotState, MoveItErrorCodes
 
 import tf2_ros
 import tf2_geometry_msgs
@@ -78,6 +80,13 @@ class MotionControlNode:
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         
+        # MoveIt IK: service, group, planning frame and tip link (must match your MoveIt config)
+        self.moveit_ik_service = rospy.get_param('~moveit_ik_service', '/compute_ik')
+        self.moveit_ik_group = rospy.get_param('~moveit_ik_group', 'manipulator')
+        self.moveit_planning_frame = rospy.get_param('~moveit_planning_frame', 'world')
+        self.moveit_ik_link = rospy.get_param('~moveit_ik_link', 'gripper_tip_link')
+        self._moveit_ik_proxy = None  # lazy init when first needed
+
         # Action client for trajectory execution (Gazebo UR5e controller)
         self.trajectory_client = actionlib.SimpleActionClient(
             '/pos_joint_traj_controller/follow_joint_trajectory',
@@ -91,6 +100,21 @@ class MotionControlNode:
         self._setup_subscribers()
         self._setup_publishers()
         self._setup_services()
+        
+        # Communication test: wait for first joint_states from Gazebo
+        rospy.loginfo("[MotionControl] Communication test: waiting for /joint_states (timeout 10s)...")
+        try:
+            msg = rospy.wait_for_message('/joint_states', JointState, timeout=10.0)
+            positions = []
+            for name in self.joint_names:
+                if name in msg.name:
+                    positions.append(msg.position[msg.name.index(name)])
+            if len(positions) == self.num_joints:
+                rospy.loginfo("[MotionControl] Communication OK (joint_states received from Gazebo)")
+            else:
+                rospy.logwarn("[MotionControl] Communication test: joint_states received but missing joints (got %d, need %d)" % (len(positions), self.num_joints))
+        except rospy.ROSException as e:
+            rospy.logwarn("[MotionControl] Communication test FAILED: %s. Check Gazebo and /joint_states." % str(e))
         
         rospy.loginfo("Motion Control Node Ready")
         rospy.loginfo("=" * 60)
@@ -153,6 +177,81 @@ class MotionControlNode:
         qy = cr * sp * cy + sr * cp * sy
         qz = cr * cp * sy - sr * sp * cy
         return [qx, qy, qz, qw]
+
+    def _fk_matrix(self, joint_angles: List[float]) -> Optional[np.ndarray]:
+        """Forward kinematics returning 4x4 transform matrix (base_link -> tool0)."""
+        if joint_angles is None or len(joint_angles) != self.num_joints:
+            return None
+        a, d, alpha, offset = self.dh_params['a'], self.dh_params['d'], self.dh_params['alpha'], self.dh_params['offset']
+        T = np.eye(4)
+        for i in range(6):
+            theta = joint_angles[i] + offset[i]
+            ct, st = np.cos(theta), np.sin(theta)
+            ca, sa = np.cos(alpha[i]), np.sin(alpha[i])
+            A = np.array([
+                [ct, -st*ca, st*sa, a[i]*ct],
+                [st, ct*ca, -ct*sa, a[i]*st],
+                [0, sa, ca, d[i]],
+                [0, 0, 0, 1]
+            ])
+            T = T @ A
+        return T
+
+    def _quat_to_rotation_matrix(self, q: List[float]) -> np.ndarray:
+        """Quaternion [qx,qy,qz,qw] -> 3x3 rotation matrix."""
+        qx, qy, qz, qw = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        return np.array([
+            [1 - 2*(qy**2 + qz**2), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+            [2*(qx*qy + qz*qw), 1 - 2*(qx**2 + qz**2), 2*(qy*qz - qx*qw)],
+            [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx**2 + qy**2)]
+        ])
+
+    def _pose_to_matrix(self, pose: Pose) -> np.ndarray:
+        """Geometry Pose (position + quaternion) -> 4x4 transform."""
+        T = np.eye(4)
+        T[0:3, 0:3] = self._quat_to_rotation_matrix([
+            pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w])
+        T[0, 3], T[1, 3], T[2, 3] = pose.position.x, pose.position.y, pose.position.z
+        return T
+
+    def _rotation_to_axis_angle(self, R: np.ndarray) -> np.ndarray:
+        """Rotation matrix 3x3 -> axis-angle vector (length = angle in rad)."""
+        angle = np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))
+        if angle < 1e-6:
+            return np.zeros(3)
+        axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+        return axis * (angle / (2 * np.sin(angle)))
+
+    def _compute_jacobian_numerical(self, q: List[float], eps: float = 1e-6) -> np.ndarray:
+        """6x6 Jacobian: [linear velocity; angular velocity] w.r.t. joint angles."""
+        J = np.zeros((6, self.num_joints))
+        T0 = self._fk_matrix(q)
+        if T0 is None:
+            return J
+        p0 = T0[0:3, 3]
+        R0 = T0[0:3, 0:3]
+        for j in range(self.num_joints):
+            qp = list(q)
+            qp[j] += eps
+            T1 = self._fk_matrix(qp)
+            if T1 is None:
+                continue
+            J[0:3, j] = (T1[0:3, 3] - p0) / eps
+            R1 = T1[0:3, 0:3]
+            J[3:6, j] = self._rotation_to_axis_angle(R1 @ R0.T) / eps
+        return J
+
+    def _get_moveit_ik_proxy(self):
+        """Lazy init and return MoveIt /compute_ik service proxy, or None if unavailable."""
+        if self._moveit_ik_proxy is not None:
+            return self._moveit_ik_proxy
+        try:
+            rospy.wait_for_service(self.moveit_ik_service, timeout=0.5)
+            self._moveit_ik_proxy = rospy.ServiceProxy(self.moveit_ik_service, GetPositionIK)
+            rospy.loginfo("[MotionControl] MoveIt IK service connected: %s", self.moveit_ik_service)
+            return self._moveit_ik_proxy
+        except (rospy.ROSException, rospy.ROSInterruptException):
+            return None
 
     # =========================================================================
     # Callbacks
@@ -258,8 +357,8 @@ class MotionControlNode:
         seed_joints: Optional[List[float]] = None
     ) -> Optional[List[float]]:
         """
-        Inverse kinematics: transform pose to base, return seed or current joints (simplified).
-        Full analytical IK can be added later; for now use seed/current as solution.
+        Inverse kinematics: target pose -> joint angles.
+        Prefer MoveIt /compute_ik service; fall back to numerical IK if unavailable or failed.
         """
         if target_pose.header.frame_id != self.base_frame:
             transformed = self._transform_pose(target_pose, self.base_frame)
@@ -267,12 +366,93 @@ class MotionControlNode:
                 rospy.logerr("[MotionControl] Failed to transform target pose to base_frame")
                 return None
             target_pose = transformed
+
+        # Try MoveIt IK first (pose must be in MoveIt's planning frame and for its tip link)
+        proxy = self._get_moveit_ik_proxy()
+        if proxy is not None:
+            pose_for_moveit = self._transform_pose(target_pose, self.moveit_planning_frame)
+            if pose_for_moveit is None:
+                rospy.logwarn("[MotionControl] Cannot transform pose to MoveIt planning_frame=%s, fallback to numerical", self.moveit_planning_frame)
+            else:
+                req = PositionIKRequest()
+                req.group_name = self.moveit_ik_group
+                req.pose_stamped = pose_for_moveit
+                req.ik_link_name = self.moveit_ik_link
+                req.avoid_collisions = False
+                req.robot_state = RobotState()
+                req.robot_state.is_diff = True
+                req.robot_state.joint_state = JointState()
+                req.robot_state.joint_state.name = list(self.joint_names)
+                seed = seed_joints if (seed_joints is not None and len(seed_joints) == self.num_joints) else self.current_joint_positions
+                req.robot_state.joint_state.position = list(seed) if seed else [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+                req.timeout = rospy.Duration(2.0)   # 0.5s was too short for some poses
+                try:
+                    resp = proxy(req)
+                    if resp.error_code.val == MoveItErrorCodes.SUCCESS and resp.solution.joint_state.name:
+                        # Map solution to self.joint_names order
+                        sol_map = dict(zip(resp.solution.joint_state.name, resp.solution.joint_state.position))
+                        out = []
+                        for name in self.joint_names:
+                            if name in sol_map:
+                                out.append(sol_map[name])
+                            else:
+                                rospy.logwarn("[MotionControl] MoveIt IK solution missing joint %s, fallback to numerical", name)
+                                return self._compute_ik_numerical(target_pose, seed_joints)
+                        if len(out) == self.num_joints:
+                            rospy.logdebug("[MotionControl] IK from MoveIt")
+                            return out
+                    else:
+                        rospy.logwarn("[MotionControl] MoveIt IK failed (error_code=%d, -31=no solution), fallback to numerical", resp.error_code.val)
+                except Exception as e:
+                    rospy.logwarn("[MotionControl] MoveIt IK call failed: %s, fallback to numerical", e)
+
+        return self._compute_ik_numerical(target_pose, seed_joints)
+
+    def _compute_ik_numerical(
+        self,
+        target_pose: PoseStamped,
+        seed_joints: Optional[List[float]] = None
+    ) -> Optional[List[float]]:
+        """Numerical IK (Jacobian pseudo-inverse). Used when MoveIt is unavailable or fails."""
+        T_target = self._pose_to_matrix(target_pose.pose)
+        p_target = T_target[0:3, 3]
+        R_target = T_target[0:3, 0:3]
         if seed_joints is not None and len(seed_joints) == self.num_joints:
-            return list(seed_joints)
-        if self.current_joint_positions is not None:
-            return list(self.current_joint_positions)
-        # Default home-like configuration
-        return [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+            q = list(seed_joints)
+        elif self.current_joint_positions is not None:
+            q = list(self.current_joint_positions)
+        else:
+            q = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+        step = 0.4
+        pos_tol, ori_tol = 2e-3, 2e-2
+        max_iter = 120
+        lambda_damp = 0.02
+        for _ in range(max_iter):
+            T = self._fk_matrix(q)
+            if T is None:
+                return None
+            p = T[0:3, 3]
+            R = T[0:3, 0:3]
+            pos_err = p_target - p
+            ori_err = self._rotation_to_axis_angle(R_target @ R.T)
+            err = np.concatenate([pos_err, ori_err])
+            if np.linalg.norm(pos_err) < pos_tol and np.linalg.norm(ori_err) < ori_tol:
+                return q
+            J = self._compute_jacobian_numerical(q)
+            try:
+                JJt = J @ J.T + (lambda_damp ** 2) * np.eye(6)
+                dq = J.T @ np.linalg.solve(JJt, err)
+            except Exception:
+                return None
+            dq_norm = np.linalg.norm(dq)
+            if dq_norm > 0.5:
+                dq = dq * (0.5 / dq_norm)
+            q = list(np.array(q) + step * dq)
+            for i, name in enumerate(self.joint_names):
+                lo, hi = self.joint_limits.get(name, [-np.pi, np.pi])
+                q[i] = np.clip(q[i], lo, hi)
+        rospy.logwarn("[MotionControl] Numerical IK did not converge (max iterations)")
+        return None
 
 
     def compute_ik_with_collision_check(
@@ -370,9 +550,10 @@ class MotionControlNode:
         if target_joints is None:
             self._publish_motion_result(GraspResult.EXECUTION_FAILED, "IK failed for target pose")
             return
-        duration = 5.0
+        # Base duration 2.0s for small teach-pendant steps (e.g. 10mm in 2s ~= 5mm/s); scale by max_velocity
+        duration = 2.0
         if cmd.max_velocity > 0:
-            duration = max(1.0, 5.0 * (1.0 / max(cmd.max_velocity, 0.01)))
+            duration = max(0.8, 2.0 * (1.0 / max(cmd.max_velocity, 0.01)))
         success = self._execute_joint_motion_impl(target_joints, duration)
         if success:
             self._publish_motion_result(GraspResult.SUCCESS, "Cartesian motion completed")
@@ -395,18 +576,21 @@ class MotionControlNode:
             self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Joint motion failed")
 
     def _execute_joint_motion_impl(self, target_joints: List[float], duration: float) -> bool:
-        """Execute joint motion via action client. Returns True on success."""
+        """Execute joint motion via action client. Single-point goal (same as test_ur5e_control). Returns True on success."""
         if self.current_joint_positions is None:
             rospy.logerr("[MotionControl] No current joint state")
             return False
         if len(target_joints) != self.num_joints:
             rospy.logerr("[MotionControl] Invalid joint count")
             return False
-        trajectory = self.generate_joint_trajectory(
-            self.current_joint_positions, target_joints, duration
-        )
+        # Match test_ur5e_control: single point, positions + time_from_start only (no vel/acc)
         goal = FollowJointTrajectoryGoal()
-        goal.trajectory = trajectory
+        goal.trajectory = JointTrajectory()
+        goal.trajectory.joint_names = self.joint_names
+        point = JointTrajectoryPoint()
+        point.positions = list(target_joints)
+        point.time_from_start = rospy.Duration(duration)
+        goal.trajectory.points.append(point)
         self.trajectory_client.send_goal(goal)
         if self.trajectory_client.wait_for_result(timeout=rospy.Duration(duration + 5.0)):
             return self.trajectory_client.get_result() is not None

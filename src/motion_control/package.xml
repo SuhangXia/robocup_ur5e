@@ -18,6 +18,7 @@
   <depend>common_msgs</depend>
   <depend>tf2_ros</depend>
   <depend>tf2_geometry_msgs</depend>
+  <depend>moveit_msgs</depend>
   
   <exec_depend>ur_kinematics</exec_depend>
 </package>
