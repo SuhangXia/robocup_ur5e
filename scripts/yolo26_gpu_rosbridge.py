@@ -7,6 +7,7 @@ GPU YOLO26 推理（rosbridge 订阅图像与深度）
 
 import argparse
 import base64
+import json
 import time
 
 import cv2
@@ -64,6 +65,7 @@ def main():
     parser.add_argument("--model", default="/workspace/weights/yolo/yolo26m.pt")
     parser.add_argument("--rgb", default="/camera/rgb/image_raw")
     parser.add_argument("--depth", default="/camera/depth/image_raw")
+    parser.add_argument("--camera-info", default="/camera/rgb/camera_info")
     parser.add_argument("--conf", type=float, default=0.5)
     parser.add_argument("--print-interval", type=float, default=0.2)
     args = parser.parse_args()
@@ -71,12 +73,32 @@ def main():
     model = YOLO(args.model)
     last_print = 0.0
     latest_depth = {"msg": None, "t": 0.0}
+    cam_intrinsics = {"fx": None, "fy": None, "cx": None, "cy": None}
 
     ros = roslibpy.Ros(host=args.host, port=args.port)
     ros.run()
 
     depth_topic = roslibpy.Topic(ros, args.depth, "sensor_msgs/Image")
     rgb_topic = roslibpy.Topic(ros, args.rgb, "sensor_msgs/Image")
+    info_topic = roslibpy.Topic(ros, args.camera_info, "sensor_msgs/CameraInfo")
+    result_topic = roslibpy.Topic(ros, "/perception/yolo26_detections", "std_msgs/String")
+
+    def on_camera_info(msg):
+        if cam_intrinsics["fx"] is None:
+            K = msg["K"]
+            cam_intrinsics["fx"] = K[0]
+            cam_intrinsics["fy"] = K[4]
+            cam_intrinsics["cx"] = K[2]
+            cam_intrinsics["cy"] = K[5]
+            print(f"Camera intrinsics: fx={K[0]:.1f} fy={K[4]:.1f} cx={K[2]:.1f} cy={K[5]:.1f}")
+
+    def pixel_to_3d(u, v, z):
+        fx = cam_intrinsics["fx"]
+        if fx is None or z is None or z <= 0:
+            return None
+        x = (u - cam_intrinsics["cx"]) * z / fx
+        y = (v - cam_intrinsics["cy"]) * z / cam_intrinsics["fy"]
+        return [round(x, 3), round(y, 3), round(z, 3)]
 
     def on_depth(msg):
         latest_depth["msg"] = msg
@@ -87,6 +109,17 @@ def main():
         now = time.time()
         if now - last_print < args.print_interval:
             return
+
+        # Gazebo 仿真时间（来自图像 header）
+        try:
+            hdr = msg.get("header", {})
+            stamp = hdr.get("stamp", {})
+            secs = stamp.get("secs", 0)
+            nsecs = stamp.get("nsecs", 0)
+            sim_time = secs + nsecs * 1e-9
+            print(f"sim_time={sim_time:.3f} (sec={secs}, nsec={nsecs})")
+        except Exception:
+            pass
 
         frame = decode_image(msg)
         depth_msg = latest_depth["msg"]
@@ -102,6 +135,7 @@ def main():
             return
 
         h, w = frame.shape[:2]
+        detections = []
         for result in results:
             if result.boxes is None:
                 continue
@@ -133,14 +167,31 @@ def main():
                     except Exception:
                         dist = None
 
+                pos_3d = pixel_to_3d(cx, cy, dist)
+
                 print(
                     f"Detected {label} conf={conf:.2f} "
                     f"bbox=({x1},{y1},{x2},{y2}) center=({cx},{cy}) "
-                    f"{color_text} distance={'n/a' if dist is None else f'{dist:.2f}m'}"
+                    f"{color_text} distance={'n/a' if dist is None else f'{dist:.2f}m'} "
+                    f"pos_cam={pos_3d if pos_3d else 'n/a'}"
                 )
+
+                detections.append({
+                    "label": label,
+                    "confidence": round(conf, 2),
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "center": [cx, cy],
+                    "distance_m": round(dist, 2) if dist is not None else None,
+                    "position_camera": pos_3d,
+                    "avg_bgr": [int(b), int(g), int(r)] if roi.size > 0 else None,
+                })
+
+        if detections:
+            result_topic.publish(roslibpy.Message({"data": json.dumps(detections, ensure_ascii=False)}))
 
         last_print = now
 
+    info_topic.subscribe(on_camera_info)
     depth_topic.subscribe(on_depth)
     rgb_topic.subscribe(on_rgb)
 
@@ -150,8 +201,10 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        info_topic.unsubscribe()
         depth_topic.unsubscribe()
         rgb_topic.unsubscribe()
+        result_topic.unadvertise()
         ros.terminate()
 
 

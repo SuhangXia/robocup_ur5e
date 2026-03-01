@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """
+JUST FOR SAMPLE, NOT USED IN THE PROJECT
 YOLO Object Detector Node
 Authors: Fazhan & Ruiyi
 Environment: CUDA 12.0 + ROS Noetic (with CPU fallback for Mac/non-NVIDIA users)

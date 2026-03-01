@@ -7,6 +7,7 @@ YOLO26 检测节点（终端输出）
   - /camera/depth/image_raw
 """
 
+import json
 import os
 import time
 
@@ -14,7 +15,8 @@ import message_filters
 import numpy as np
 import rospy
 from cv_bridge import CvBridge, CvBridgeError
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import CameraInfo, Image
+from std_msgs.msg import String
 
 
 class Yolo26InfoNode:
@@ -22,7 +24,7 @@ class Yolo26InfoNode:
         rospy.init_node("yolo26_info", anonymous=True)
 
         self.bridge = CvBridge()
-        self.model_path = rospy.get_param("~model_path", "/workspace/weights/yolo/yolo26m.pt")
+        self.model_path = rospy.get_param("~model_path", "/workspace/weights/yolo/yolo26n.pt")
         self.conf_threshold = float(rospy.get_param("~confidence_threshold", 0.5))
         self.image_topic = rospy.get_param("~image_topic", "/camera/rgb/image_raw")
         self.depth_topic = rospy.get_param("~depth_topic", "/camera/depth/image_raw")
@@ -43,6 +45,16 @@ class Yolo26InfoNode:
         rospy.loginfo("Subscribing Depth: %s", self.depth_topic)
         rospy.loginfo("Confidence threshold: %.2f", self.conf_threshold)
 
+        self.camera_info_topic = rospy.get_param("~camera_info_topic", "/camera/rgb/camera_info")
+        self.fx = None
+        self.fy = None
+        self.cx_cam = None
+        self.cy_cam = None
+        rospy.Subscriber(self.camera_info_topic, CameraInfo, self._camera_info_cb)
+        rospy.loginfo("Subscribing CameraInfo: %s", self.camera_info_topic)
+
+        self.detection_pub = rospy.Publisher("/perception/yolo26_detections", String, queue_size=10)
+
         rgb_sub = message_filters.Subscriber(self.image_topic, Image)
         depth_sub = message_filters.Subscriber(self.depth_topic, Image)
         self.sync = message_filters.ApproximateTimeSynchronizer(
@@ -50,10 +62,33 @@ class Yolo26InfoNode:
         )
         self.sync.registerCallback(self.image_callback)
 
+    def _camera_info_cb(self, msg):
+        if self.fx is None:
+            K = msg.K
+            self.fx = K[0]
+            self.fy = K[4]
+            self.cx_cam = K[2]
+            self.cy_cam = K[5]
+            rospy.loginfo("Camera intrinsics: fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
+                          self.fx, self.fy, self.cx_cam, self.cy_cam)
+
+    def _pixel_to_3d(self, u, v, z):
+        if self.fx is None or z is None or z <= 0:
+            return None
+        x = (u - self.cx_cam) * z / self.fx
+        y = (v - self.cy_cam) * z / self.fy
+        return [round(x, 3), round(y, 3), round(z, 3)]
+
     def image_callback(self, rgb_msg, depth_msg):
         now = time.time()
         if now - self._last_print < self.print_interval:
             return
+
+        # Gazebo 仿真时间（来自图像消息的 header）
+        sim_stamp = rgb_msg.header.stamp
+        sim_time = sim_stamp.to_sec()
+        rospy.loginfo("YOLO26 sim_time=%.3f (sec=%d, nsec=%d)",
+                      sim_time, sim_stamp.secs, sim_stamp.nsecs)
 
         try:
             frame = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding="bgr8")
@@ -67,6 +102,7 @@ class Yolo26InfoNode:
             return
 
         h, w = frame.shape[:2]
+        detections = []
         for result in results:
             if result.boxes is None:
                 continue
@@ -96,11 +132,38 @@ class Yolo26InfoNode:
                 except Exception:
                     dist = None
 
+                roi = frame[y1:y2 + 1, x1:x2 + 1]
+                if roi.size > 0:
+                    b, g, r = roi.mean(axis=(0, 1))
+                    avg_bgr = [int(b), int(g), int(r)]
+                else:
+                    avg_bgr = None
+
+                pos_3d = self._pixel_to_3d(cx, cy, dist)
+
+                det = {
+                    "label": label,
+                    "confidence": round(conf, 2),
+                    "bbox": [int(x1), int(y1), int(x2), int(y2)],
+                    "center": [cx, cy],
+                    "distance_m": round(dist, 2) if dist is not None else None,
+                    "position_camera": pos_3d,
+                    "avg_bgr": avg_bgr,
+                }
+                detections.append(det)
+
                 rospy.loginfo(
-                    "Detected %s conf=%.2f bbox=(%d,%d,%d,%d) center=(%d,%d) distance=%s",
+                    "Detected %s conf=%.2f bbox=(%d,%d,%d,%d) center=(%d,%d) avg_bgr=%s distance=%s pos_cam=%s",
                     label, conf, x1, y1, x2, y2, cx, cy,
-                    f"{dist:.2f}m" if dist is not None else "n/a"
+                    str(avg_bgr) if avg_bgr else "n/a",
+                    f"{dist:.2f}m" if dist is not None else "n/a",
+                    str(pos_3d) if pos_3d else "n/a"
                 )
+
+        if detections:
+            msg = String()
+            msg.data = json.dumps(detections, ensure_ascii=False)
+            self.detection_pub.publish(msg)
 
         self._last_print = now
 
