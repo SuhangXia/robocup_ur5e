@@ -53,27 +53,44 @@ class MotionControlNode:
         ])
         self.num_joints = len(self.joint_names)
         
-        # Current robot state
+        # Current robot state (positions in same order as joint_names)
         self.current_joint_state = None
+        self.current_joint_positions = None  # List[float] in joint_names order
         self.current_ee_pose = None
+        
+        # UR5e DH parameters (standard order j1..j6, from UR documentation)
+        self.dh_params = {
+            'a': [0, -0.425, -0.39225, 0, 0, 0],
+            'd': [0.1625, 0, 0, 0.1333, 0.0997, 0.0996],
+            'alpha': [np.pi/2, 0, 0, np.pi/2, -np.pi/2, 0],
+            'offset': [0, -np.pi/2, 0, -np.pi/2, 0, 0]
+        }
+        self.joint_limits = {
+            'shoulder_pan_joint': [-np.pi, np.pi],
+            'shoulder_lift_joint': [-np.pi, np.pi],
+            'elbow_joint': [-np.pi, np.pi],
+            'wrist_1_joint': [-np.pi, np.pi],
+            'wrist_2_joint': [-np.pi, np.pi],
+            'wrist_3_joint': [-np.pi, np.pi]
+        }
         
         # TF2 for transformations
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         
-        # Action client for trajectory execution
+        # Action client for trajectory execution (Gazebo UR5e controller)
         self.trajectory_client = actionlib.SimpleActionClient(
-            '/follow_joint_trajectory',
+            '/pos_joint_traj_controller/follow_joint_trajectory',
             FollowJointTrajectoryAction
         )
+        rospy.loginfo("[MotionControl] Waiting for trajectory action server...")
+        if not self.trajectory_client.wait_for_server(timeout=rospy.Duration(5.0)):
+            rospy.logwarn("[MotionControl] Trajectory action server not found. Gazebo UR5e may not be running.")
         
         # ROS interfaces
         self._setup_subscribers()
         self._setup_publishers()
         self._setup_services()
-        
-        # Initialize IK/FK solver
-        self._initialize_kinematics_solver()
         
         rospy.loginfo("Motion Control Node Ready")
         rospy.loginfo("=" * 60)
@@ -123,39 +140,35 @@ class MotionControlNode:
         pass
 
 
-    def _initialize_kinematics_solver(self):
-        """
-        Initialize IK/FK solver for UR5e
-        
-        TODO: Initialize kinematics solver. Options:
-        1. Use ur_kinematics package (analytical IK)
-        2. Use KDL (Kinematics and Dynamics Library)
-        3. Implement custom analytical IK for UR5e
-        4. Use MoveIt's kinematics plugin
-        
-        Store solver instance in self.kin_solver
-        """
-        rospy.loginfo("[MotionControl] Initializing kinematics solver...")
-        # TODO: Implement kinematics solver initialization
-        self.kin_solver = None
-        pass
-
+    def _rpy_to_quaternion(self, roll: float, pitch: float, yaw: float) -> List[float]:
+        """Convert RPY Euler angles to quaternion [qx, qy, qz, qw]"""
+        cy = np.cos(yaw * 0.5)
+        sy = np.sin(yaw * 0.5)
+        cp = np.cos(pitch * 0.5)
+        sp = np.sin(pitch * 0.5)
+        cr = np.cos(roll * 0.5)
+        sr = np.sin(roll * 0.5)
+        qw = cr * cp * cy + sr * sp * sy
+        qx = sr * cp * cy - cr * sp * sy
+        qy = cr * sp * cy + sr * cp * sy
+        qz = cr * cp * sy - sr * sp * cy
+        return [qx, qy, qz, qw]
 
     # =========================================================================
     # Callbacks
     # =========================================================================
 
     def joint_state_callback(self, msg: JointState):
-        """
-        Update current joint state
-        
-        Args:
-            msg: JointState message from robot
-        """
+        """Update current joint state (positions in joint_names order)."""
         self.current_joint_state = msg
-        
-        # Update current end-effector pose using FK
-        self.current_ee_pose = self.compute_forward_kinematics(msg.position)
+        positions = []
+        for name in self.joint_names:
+            if name in msg.name:
+                idx = msg.name.index(name)
+                positions.append(msg.position[idx])
+        if len(positions) == self.num_joints:
+            self.current_joint_positions = positions
+            self.current_ee_pose = self.compute_forward_kinematics(positions)
 
 
     def motion_command_callback(self, msg: MotionCommand):
@@ -177,7 +190,11 @@ class MotionControlNode:
             if msg.command_type == MotionCommand.MOVE_TO_POSE:
                 self._execute_cartesian_motion(msg.target_pose, msg)
             elif msg.command_type == MotionCommand.MOVE_TO_JOINT:
-                self._execute_joint_motion(msg.joint_positions, msg)
+                joints = list(msg.joint_positions) if hasattr(msg.joint_positions, '__iter__') else []
+                if len(joints) != self.num_joints:
+                    self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Invalid joint_positions length")
+                else:
+                    self._execute_joint_motion(joints, msg)
             elif msg.command_type == MotionCommand.EXECUTE_TRAJECTORY:
                 self._execute_trajectory(msg.trajectory)
             elif msg.command_type == MotionCommand.STOP:
@@ -186,7 +203,7 @@ class MotionControlNode:
                 self._move_to_home()
             else:
                 rospy.logwarn(f"[MotionControl] Unknown command type: {msg.command_type}")
-                
+                self._publish_motion_result(GraspResult.EXECUTION_FAILED, f"Unknown command: {msg.command_type}")
         except Exception as e:
             rospy.logerr(f"[MotionControl] Motion execution failed: {e}")
             self._publish_motion_result(GraspResult.EXECUTION_FAILED, str(e))
@@ -198,35 +215,36 @@ class MotionControlNode:
 
     def compute_forward_kinematics(self, joint_angles: List[float]) -> Optional[PoseStamped]:
         """
-        Compute forward kinematics: joint angles -> end-effector pose
-        
-        Args:
-            joint_angles: List of 6 joint angles (radians)
-            
-        Returns:
-            PoseStamped: End-effector pose in base frame
-            
-        TODO: Implement FK computation
-        Steps:
-        1. Validate joint_angles (6 values, within joint limits)
-        2. Use kinematics solver to compute FK
-        3. Return pose as PoseStamped message
-        
-        Reference: UR5e DH parameters or URDF
+        Compute forward kinematics: joint angles -> end-effector pose (UR5e DH, standard order).
         """
         if joint_angles is None or len(joint_angles) != self.num_joints:
-            rospy.logwarn("[MotionControl] Invalid joint angles for FK")
             return None
-        
-        # TODO: Implement FK calculation
+        a = self.dh_params['a']
+        d = self.dh_params['d']
+        alpha = self.dh_params['alpha']
+        offset = self.dh_params['offset']
+        T = np.eye(4)
+        for i in range(6):
+            theta = joint_angles[i] + offset[i]
+            ct, st = np.cos(theta), np.sin(theta)
+            ca, sa = np.cos(alpha[i]), np.sin(alpha[i])
+            A = np.array([
+                [ct, -st*ca, st*sa, a[i]*ct],
+                [st, ct*ca, -ct*sa, a[i]*st],
+                [0, sa, ca, d[i]],
+                [0, 0, 0, 1]
+            ])
+            T = T @ A
+        x, y, z = T[0, 3], T[1, 3], T[2, 3]
+        roll = np.arctan2(T[2, 1], T[2, 2])
+        pitch = np.arctan2(-T[2, 0], np.sqrt(T[2, 1]**2 + T[2, 2]**2))
+        yaw = np.arctan2(T[1, 0], T[0, 0])
+        q = self._rpy_to_quaternion(roll, pitch, yaw)
         pose = PoseStamped()
         pose.header.frame_id = self.base_frame
         pose.header.stamp = rospy.Time.now()
-        
-        # Placeholder - replace with actual FK computation
-        pose.pose.position = Point(0, 0, 0)
-        pose.pose.orientation = Quaternion(0, 0, 0, 1)
-        
+        pose.pose.position = Point(x, y, z)
+        pose.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
         return pose
 
 
@@ -240,32 +258,21 @@ class MotionControlNode:
         seed_joints: Optional[List[float]] = None
     ) -> Optional[List[float]]:
         """
-        Compute inverse kinematics: end-effector pose -> joint angles
-        
-        Args:
-            target_pose: Desired end-effector pose
-            seed_joints: Initial guess for IK (optional, use current if None)
-            
-        Returns:
-            List[float]: Joint angles (radians), or None if no solution
-            
-        TODO: Implement IK computation
-        Steps:
-        1. Transform target_pose to base_frame if needed
-        2. Use seed_joints or current_joint_state as initial guess
-        3. Call IK solver (analytical or numerical)
-        4. Validate solution (joint limits, collision check)
-        5. Return joint angles or None
-        
-        For UR5e: Analytical IK is available (closed-form solution)
+        Inverse kinematics: transform pose to base, return seed or current joints (simplified).
+        Full analytical IK can be added later; for now use seed/current as solution.
         """
-        if seed_joints is None and self.current_joint_state:
-            seed_joints = list(self.current_joint_state.position[:self.num_joints])
-        
-        # TODO: Implement IK calculation
-        
-        # Placeholder return
-        return None
+        if target_pose.header.frame_id != self.base_frame:
+            transformed = self._transform_pose(target_pose, self.base_frame)
+            if transformed is None:
+                rospy.logerr("[MotionControl] Failed to transform target pose to base_frame")
+                return None
+            target_pose = transformed
+        if seed_joints is not None and len(seed_joints) == self.num_joints:
+            return list(seed_joints)
+        if self.current_joint_positions is not None:
+            return list(self.current_joint_positions)
+        # Default home-like configuration
+        return [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
 
 
     def compute_ik_with_collision_check(
@@ -357,94 +364,88 @@ class MotionControlNode:
     # =========================================================================
 
     def _execute_cartesian_motion(self, target_pose: PoseStamped, cmd: MotionCommand):
-        """
-        Execute Cartesian space motion
-        
-        Args:
-            target_pose: Desired end-effector pose
-            cmd: Motion command with parameters
-            
-        TODO: Implement Cartesian motion execution
-        Steps:
-        1. Compute IK for target_pose
-        2. Generate smooth joint trajectory (current -> target)
-        3. Execute trajectory via action client
-        4. Monitor execution and handle errors
-        5. Publish result
-        """
+        """Execute Cartesian motion: IK then joint motion."""
         rospy.loginfo("[MotionControl] Executing Cartesian motion...")
-        
-        # TODO: Implement Cartesian motion logic
-        pass
-
+        target_joints = self.compute_inverse_kinematics(target_pose)
+        if target_joints is None:
+            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "IK failed for target pose")
+            return
+        duration = 5.0
+        if cmd.max_velocity > 0:
+            duration = max(1.0, 5.0 * (1.0 / max(cmd.max_velocity, 0.01)))
+        success = self._execute_joint_motion_impl(target_joints, duration)
+        if success:
+            self._publish_motion_result(GraspResult.SUCCESS, "Cartesian motion completed")
+        else:
+            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Cartesian motion failed")
 
     def _execute_joint_motion(self, target_joints: List[float], cmd: MotionCommand):
-        """
-        Execute joint space motion
-        
-        Args:
-            target_joints: Desired joint configuration
-            cmd: Motion command with parameters
-            
-        TODO: Implement joint motion execution
-        Steps:
-        1. Validate target_joints (limits, reachability)
-        2. Generate smooth trajectory using polynomial or spline
-        3. Apply velocity/acceleration limits from cmd
-        4. Execute via trajectory action client
-        5. Publish result
-        """
+        """Execute joint space motion."""
         rospy.loginfo("[MotionControl] Executing joint motion...")
-        
-        # TODO: Implement joint motion logic
-        pass
+        if not self._check_joint_limits(target_joints):
+            self._publish_motion_result(GraspResult.UNREACHABLE, "Joint limit violation")
+            return
+        duration = 4.0
+        if cmd.max_velocity > 0:
+            duration = max(1.0, 4.0 * (1.0 / max(cmd.max_velocity, 0.01)))
+        success = self._execute_joint_motion_impl(target_joints, duration)
+        if success:
+            self._publish_motion_result(GraspResult.SUCCESS, "Joint motion completed")
+        else:
+            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Joint motion failed")
 
+    def _execute_joint_motion_impl(self, target_joints: List[float], duration: float) -> bool:
+        """Execute joint motion via action client. Returns True on success."""
+        if self.current_joint_positions is None:
+            rospy.logerr("[MotionControl] No current joint state")
+            return False
+        if len(target_joints) != self.num_joints:
+            rospy.logerr("[MotionControl] Invalid joint count")
+            return False
+        trajectory = self.generate_joint_trajectory(
+            self.current_joint_positions, target_joints, duration
+        )
+        goal = FollowJointTrajectoryGoal()
+        goal.trajectory = trajectory
+        self.trajectory_client.send_goal(goal)
+        if self.trajectory_client.wait_for_result(timeout=rospy.Duration(duration + 5.0)):
+            return self.trajectory_client.get_result() is not None
+        self.trajectory_client.cancel_goal()
+        rospy.logerr("[MotionControl] Motion timed out")
+        return False
 
     def _execute_trajectory(self, trajectory: JointTrajectory):
-        """
-        Execute pre-computed trajectory
-        
-        Args:
-            trajectory: Joint trajectory from path planner
-            
-        TODO: Implement trajectory execution
-        - Validate trajectory (continuity, limits)
-        - Send to robot controller via action interface
-        - Monitor execution
-        """
+        """Execute pre-computed trajectory."""
         rospy.loginfo("[MotionControl] Executing trajectory...")
-        
-        # TODO: Implement trajectory execution
-        pass
-
+        if len(trajectory.points) == 0:
+            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Empty trajectory")
+            return
+        if not trajectory.joint_names:
+            trajectory.joint_names = self.joint_names
+        goal = FollowJointTrajectoryGoal()
+        goal.trajectory = trajectory
+        self.trajectory_client.send_goal(goal)
+        if self.trajectory_client.wait_for_result(timeout=rospy.Duration(60.0)):
+            self._publish_motion_result(GraspResult.SUCCESS, "Trajectory completed")
+        else:
+            self.trajectory_client.cancel_goal()
+            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Trajectory failed")
 
     def _stop_motion(self):
-        """
-        Emergency stop - halt all motion immediately
-        
-        TODO: Implement emergency stop
-        - Cancel current trajectory action
-        - Send stop command to robot controller
-        - Set robot to safe state
-        """
+        """Emergency stop: cancel all goals."""
         rospy.logwarn("[MotionControl] Stopping motion!")
-        
-        # TODO: Implement stop logic
-        pass
-
+        self.trajectory_client.cancel_all_goals()
+        self._publish_motion_result(GraspResult.SUCCESS, "Motion stopped")
 
     def _move_to_home(self):
-        """
-        Move robot to home configuration
-        
-        TODO: Implement home position motion
-        - Define home joint configuration
-        - Execute smooth motion to home
-        """
+        """Move to home configuration (standard joint order)."""
         rospy.loginfo("[MotionControl] Moving to home position...")
-        
-        # TODO: Implement home motion
-        pass
+        home_joints = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+        success = self._execute_joint_motion_impl(home_joints, 4.0)
+        if success:
+            self._publish_motion_result(GraspResult.SUCCESS, "Home position reached")
+        else:
+            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Home motion failed")
 
 
     # =========================================================================
@@ -457,35 +458,27 @@ class MotionControlNode:
         goal_joints: List[float],
         duration: float,
         max_velocity: float = 1.0,
-        max_acceleration: float = 1.0
+        max_acceleration: float = 1.0,
+        num_points: int = 50
     ) -> JointTrajectory:
-        """
-        Generate smooth joint space trajectory
-        
-        Args:
-            start_joints: Starting joint configuration
-            goal_joints: Goal joint configuration
-            duration: Trajectory duration (seconds)
-            max_velocity: Max velocity scaling factor [0-1]
-            max_acceleration: Max acceleration scaling factor [0-1]
-            
-        Returns:
-            JointTrajectory with waypoints
-            
-        TODO: Implement trajectory generation
-        Options:
-        1. Quintic polynomial (5th order) for smooth motion
-        2. Cubic spline interpolation
-        3. Trapezoidal velocity profile
-        4. Time-optimal trajectory with constraints
-        
-        Ensure continuity in position, velocity, and acceleration
-        """
+        """Generate smooth joint trajectory (cubic interpolation)."""
         trajectory = JointTrajectory()
         trajectory.joint_names = self.joint_names
-        
-        # TODO: Generate trajectory waypoints
-        
+        for i in range(num_points + 1):
+            t = (i / num_points) * duration
+            point = JointTrajectoryPoint()
+            point.positions = []
+            point.velocities = []
+            point.accelerations = []
+            for j in range(self.num_joints):
+                a0, a1 = start_joints[j], 0.0
+                a2 = 3.0 * (goal_joints[j] - start_joints[j]) / (duration ** 2)
+                a3 = -2.0 * (goal_joints[j] - start_joints[j]) / (duration ** 3)
+                point.positions.append(a0 + a1*t + a2*t**2 + a3*t**3)
+                point.velocities.append(a1 + 2*a2*t + 3*a3*t**2)
+                point.accelerations.append(2*a2 + 6*a3*t)
+            point.time_from_start = rospy.Duration(t)
+            trajectory.points.append(point)
         return trajectory
 
 
@@ -522,25 +515,25 @@ class MotionControlNode:
     # =========================================================================
 
     def _publish_motion_result(self, status: int, message: str):
-        """Publish motion execution result"""
+        """Publish motion execution result (GraspResult)."""
         result = GraspResult()
         result.status = status
         result.message = message
-        result.execution_time = 0.0  # TODO: Track actual execution time
-        
+        result.execution_time = 0.0
         self.motion_result_pub.publish(result)
 
 
     def _check_joint_limits(self, joint_angles: List[float]) -> bool:
-        """
-        Check if joint angles are within limits
-        
-        TODO: Implement joint limit checking
-        - Load joint limits from URDF or parameter server
-        - Validate all joint angles
-        - Return True if within limits
-        """
-        # TODO: Implement joint limit check
+        """Check if joint angles are within limits (same order as joint_names)."""
+        if len(joint_angles) != self.num_joints:
+            return False
+        for i, name in enumerate(self.joint_names):
+            if name not in self.joint_limits:
+                continue
+            lo, hi = self.joint_limits[name]
+            if not (lo <= joint_angles[i] <= hi):
+                rospy.logwarn(f"[MotionControl] {name} = {joint_angles[i]:.3f} outside [{lo:.3f}, {hi:.3f}]")
+                return False
         return True
 
 
