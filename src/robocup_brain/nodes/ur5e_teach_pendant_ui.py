@@ -10,6 +10,7 @@ Usage:
 """
 
 import sys
+import threading
 import rospy
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,6 +24,9 @@ from PyQt5.QtGui import QFont
 from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion
 from sensor_msgs.msg import JointState
 from common_msgs.msg import MotionCommand, GraspResult
+import tf2_ros
+import tf2_geometry_msgs
+import tf.transformations as tf_trans
 
 
 class UR5eTeachPendantUI(QMainWindow):
@@ -43,9 +47,11 @@ class UR5eTeachPendantUI(QMainWindow):
 
         self.linear_step = 0.01
         self.rotation_step = 0.087
-        self.current_pose = None
+        self.current_pose = None      # dict with x,y,z,roll,pitch,yaw for display
+        self.current_pose_stamped = None  # PoseStamped for sending to motion_control
         self.current_joints = None
         self.is_moving = False
+        self.recorded_points_list = []  # list of {"pose": dict, "joints": list, "index": int}
 
         self.init_ros()
         self.init_ui()
@@ -64,9 +70,72 @@ class UR5eTeachPendantUI(QMainWindow):
             self.motion_cmd_pub = rospy.Publisher('/motion/command', MotionCommand, queue_size=10)
             self.joint_state_sub = rospy.Subscriber('/joint_states', JointState, self.on_joint_state_received)
             self.motion_result_sub = rospy.Subscriber('/motion/result', GraspResult, self.on_motion_result_received)
+            self.tf_buffer = tf2_ros.Buffer()
+            self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+            # Run rospy callbacks in a background thread (rospy.spin_once not in older rospy)
+            self._ros_thread = threading.Thread(target=self._ros_spin_thread, daemon=True)
+            self._ros_thread.start()
             rospy.loginfo("[TeachPendantUI] ROS initialized")
         except Exception as e:
             rospy.logerr(f"[TeachPendantUI] ROS init failed: {e}")
+
+    def _ros_spin_thread(self):
+        """Background thread: run rospy.spin() so callbacks (joint_states, motion/result, TF) run."""
+        try:
+            rospy.spin()
+        except rospy.exceptions.ROSInterruptException:
+            pass
+        except Exception:
+            pass
+
+    def _get_current_pose_from_tf(self):
+        """
+        Get current end-effector pose (base_link -> tcp_link).
+        tcp_link should match MoveIt's tip link (e.g. gripper_tip_link) so IK is consistent.
+        Returns (PoseStamped or None, pose_dict or None). pose_dict has x,y,z,roll,pitch,yaw.
+        """
+        tcp_link = rospy.get_param('~tcp_link', 'gripper_tip_link')  # same as MoveIt ik_link
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                'base_link', tcp_link, rospy.Time(0), rospy.Duration(0.5)
+            )
+            pose = PoseStamped()
+            pose.header = trans.header
+            pose.pose.position = Point(
+                trans.transform.translation.x,
+                trans.transform.translation.y,
+                trans.transform.translation.z
+            )
+            pose.pose.orientation = Quaternion(
+                trans.transform.rotation.x,
+                trans.transform.rotation.y,
+                trans.transform.rotation.z,
+                trans.transform.rotation.w
+            )
+            r = trans.transform.rotation
+            q = [r.x, r.y, r.z, r.w]
+            roll, pitch, yaw = tf_trans.euler_from_quaternion(q)
+            pose_dict = {
+                'x': pose.pose.position.x, 'y': pose.pose.position.y, 'z': pose.pose.position.z,
+                'roll': roll, 'pitch': pitch, 'yaw': yaw
+            }
+            return pose, pose_dict
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logdebug("[TeachPendantUI] TF lookup failed: %s" % str(e))
+            return None, None
+
+    def _send_move_to_pose(self, target_pose_stamped):
+        """Publish MotionCommand MOVE_TO_POSE."""
+        target_pose_stamped.header.stamp = rospy.Time.now()
+        target_pose_stamped.header.frame_id = 'base_link'
+        cmd = MotionCommand()
+        cmd.command_type = MotionCommand.MOVE_TO_POSE
+        cmd.target_pose = target_pose_stamped
+        cmd.max_velocity = 1.0   # 1.0 => ~5s for Cartesian; 0.5 => ~10s (slower)
+        cmd.max_acceleration = 1.0
+        self.motion_cmd_pub.publish(cmd)
+        self.is_moving = True
+        self.status_updated_signal.emit("Status: Moving...")
 
     def init_ui(self):
         central_widget = QWidget()
@@ -221,42 +290,160 @@ class UR5eTeachPendantUI(QMainWindow):
         self.log(f"Rotation step set: {value:.1f} deg")
 
     def on_x_negative_clicked(self):
-        self.log(f"[TODO] X- {-self.linear_step*1000:.1f} mm")
-    def on_x_positive_clicked(self):
-        self.log(f"[TODO] X+ +{self.linear_step*1000:.1f} mm")
-    def on_y_negative_clicked(self):
-        self.log(f"[TODO] Y- -{self.linear_step*1000:.1f} mm")
-    def on_y_positive_clicked(self):
-        self.log(f"[TODO] Y+ +{self.linear_step*1000:.1f} mm")
-    def on_z_negative_clicked(self):
-        self.log(f"[TODO] Z- -{self.linear_step*1000:.1f} mm")
-    def on_z_positive_clicked(self):
-        self.log(f"[TODO] Z+ +{self.linear_step*1000:.1f} mm")
-    def on_roll_negative_clicked(self):
-        self.log(f"[TODO] Roll- -{self.rotation_step*180/3.14159:.1f} deg")
-    def on_roll_positive_clicked(self):
-        self.log(f"[TODO] Roll+ +{self.rotation_step*180/3.14159:.1f} deg")
-    def on_pitch_negative_clicked(self):
-        self.log(f"[TODO] Pitch- -{self.rotation_step*180/3.14159:.1f} deg")
-    def on_pitch_positive_clicked(self):
-        self.log(f"[TODO] Pitch+ +{self.rotation_step*180/3.14159:.1f} deg")
-    def on_yaw_negative_clicked(self):
-        self.log(f"[TODO] Yaw- -{self.rotation_step*180/3.14159:.1f} deg")
-    def on_yaw_positive_clicked(self):
-        self.log(f"[TODO] Yaw+ +{self.rotation_step*180/3.14159:.1f} deg")
-    def on_home_clicked(self):
-        self.log("[TODO] Go to Home")
-    def on_stop_clicked(self):
-        self.log("[TODO] E-Stop")
-    def on_record_point_clicked(self):
-        if self.current_pose is None:
-            self.log("Cannot record: current pose unknown")
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("X-: No current pose (TF base_link->tool0)")
             return
-        self.log("[TODO] Record point")
+        pose_stamped.pose.position.x -= self.linear_step
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"X- {-self.linear_step*1000:.1f} mm")
+    def on_x_positive_clicked(self):
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("X+: No current pose")
+            return
+        pose_stamped.pose.position.x += self.linear_step
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"X+ +{self.linear_step*1000:.1f} mm")
+    def on_y_negative_clicked(self):
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("Y-: No current pose")
+            return
+        pose_stamped.pose.position.y -= self.linear_step
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Y- -{self.linear_step*1000:.1f} mm")
+    def on_y_positive_clicked(self):
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("Y+: No current pose")
+            return
+        pose_stamped.pose.position.y += self.linear_step
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Y+ +{self.linear_step*1000:.1f} mm")
+    def on_z_negative_clicked(self):
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("Z-: No current pose")
+            return
+        pose_stamped.pose.position.z -= self.linear_step
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Z- -{self.linear_step*1000:.1f} mm")
+    def on_z_positive_clicked(self):
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("Z+: No current pose")
+            return
+        pose_stamped.pose.position.z += self.linear_step
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Z+ +{self.linear_step*1000:.1f} mm")
+    def on_roll_negative_clicked(self):
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_stamped is None or pose_dict is None:
+            self.log("Roll-: No current pose")
+            return
+        r, p, y = pose_dict['roll'] - self.rotation_step, pose_dict['pitch'], pose_dict['yaw']
+        q = tf_trans.quaternion_from_euler(r, p, y)
+        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Roll- -{self.rotation_step*180/3.14159:.1f} deg")
+    def on_roll_positive_clicked(self):
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_stamped is None or pose_dict is None:
+            self.log("Roll+: No current pose")
+            return
+        r, p, y = pose_dict['roll'] + self.rotation_step, pose_dict['pitch'], pose_dict['yaw']
+        q = tf_trans.quaternion_from_euler(r, p, y)
+        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Roll+ +{self.rotation_step*180/3.14159:.1f} deg")
+    def on_pitch_negative_clicked(self):
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_stamped is None or pose_dict is None:
+            self.log("Pitch-: No current pose")
+            return
+        r, p, y = pose_dict['roll'], pose_dict['pitch'] - self.rotation_step, pose_dict['yaw']
+        q = tf_trans.quaternion_from_euler(r, p, y)
+        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Pitch- -{self.rotation_step*180/3.14159:.1f} deg")
+    def on_pitch_positive_clicked(self):
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_stamped is None or pose_dict is None:
+            self.log("Pitch+: No current pose")
+            return
+        r, p, y = pose_dict['roll'], pose_dict['pitch'] + self.rotation_step, pose_dict['yaw']
+        q = tf_trans.quaternion_from_euler(r, p, y)
+        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Pitch+ +{self.rotation_step*180/3.14159:.1f} deg")
+    def on_yaw_negative_clicked(self):
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_stamped is None or pose_dict is None:
+            self.log("Yaw-: No current pose")
+            return
+        r, p, y = pose_dict['roll'], pose_dict['pitch'], pose_dict['yaw'] - self.rotation_step
+        q = tf_trans.quaternion_from_euler(r, p, y)
+        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Yaw- -{self.rotation_step*180/3.14159:.1f} deg")
+    def on_yaw_positive_clicked(self):
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_stamped is None or pose_dict is None:
+            self.log("Yaw+: No current pose")
+            return
+        r, p, y = pose_dict['roll'], pose_dict['pitch'], pose_dict['yaw'] + self.rotation_step
+        q = tf_trans.quaternion_from_euler(r, p, y)
+        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
+        self._send_move_to_pose(pose_stamped)
+        self.log(f"Yaw+ +{self.rotation_step*180/3.14159:.1f} deg")
+    def on_home_clicked(self):
+        cmd = MotionCommand()
+        cmd.command_type = MotionCommand.HOME
+        self.motion_cmd_pub.publish(cmd)
+        self.is_moving = True
+        self.status_updated_signal.emit("Status: Going Home...")
+        self.log("Go to Home")
+    def on_stop_clicked(self):
+        cmd = MotionCommand()
+        cmd.command_type = MotionCommand.STOP
+        self.motion_cmd_pub.publish(cmd)
+        self.is_moving = False
+        self.status_updated_signal.emit("Status: E-Stop sent")
+        self.log("E-Stop")
+    def on_record_point_clicked(self):
+        _, pose_dict = self._get_current_pose_from_tf()
+        if pose_dict is None:
+            self.log("Cannot record: current pose unknown (TF)")
+            return
+        self.current_pose = pose_dict
+        idx = len(self.recorded_points_list) + 1
+        self.recorded_points_list.append({
+            "pose": dict(pose_dict),
+            "joints": list(self.current_joints) if self.current_joints else None,
+            "index": idx
+        })
+        self._update_recorded_points_display()
+        self.log("Record point #%d" % idx)
     def on_clear_points_clicked(self):
-        self.log("[TODO] Clear points")
+        self.recorded_points_list.clear()
+        self._update_recorded_points_display()
+        self.log("Clear points")
+    def _update_recorded_points_display(self):
+        lines = []
+        for rec in self.recorded_points_list:
+            p = rec["pose"]
+            lines.append("P#%d: x=%.3f y=%.3f z=%.3f" % (rec["index"], p["x"], p["y"], p["z"]))
+        self.recorded_points.setPlainText("\n".join(lines) if lines else "(none)")
     def on_refresh_pose_clicked(self):
-        self.log("[TODO] Refresh pose")
+        pose_stamped, pose_dict = self._get_current_pose_from_tf()
+        if pose_dict is None:
+            self.log("Refresh pose: TF failed (base_link->tool0)")
+            return
+        self.current_pose = pose_dict
+        self.current_pose_stamped = pose_stamped
+        self.pose_updated_signal.emit(pose_dict)
+        self.log("Refresh pose OK")
 
     def on_joint_state_received(self, msg):
         joints = []
@@ -267,12 +454,12 @@ class UR5eTeachPendantUI(QMainWindow):
             self.joints_updated_signal.emit(joints)
 
     def on_motion_result_received(self, msg):
-        if msg.success:
+        if msg.status == GraspResult.SUCCESS:
             self.status_updated_signal.emit("Status: Motion OK")
-            self.log(f"OK {msg.message}")
+            self.log("OK %s" % msg.message)
         else:
             self.status_updated_signal.emit("Status: Motion Failed")
-            self.log(f"Failed {msg.message}")
+            self.log("Failed %s" % msg.message)
         self.is_moving = False
 
     def on_pose_updated(self, pose_dict):

@@ -28,6 +28,7 @@ catkin_package(
 
 catkin_install_python(PROGRAMS
   nodes/motion_control_node.py
+  scripts/check_moveit_ik.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

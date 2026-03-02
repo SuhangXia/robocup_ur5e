@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# =============================================================================
+# 仅进入已运行的容器并 source 环境（不启动 compose）
+# 需要「启动某一服务 + 挂载代码 + 进 shell」请用: ./docker/run_<服务>_docker.bash
+# 用法:
+#   ./docker/run                    # 默认容器 robocup_brain_manual
+#   ./docker/run <容器名>            # 指定容器
+#   ./docker/run <容器名> -- <命令>  # 在容器内执行命令后退出
+# =============================================================================
+set -e
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# 解析参数：容器名 与 可选命令
+CONTAINER=""
+RUN_CMD=()
+if [[ -n "$1" && "$1" != "--" ]]; then
+  CONTAINER="$1"
+  shift
+  if [[ "$1" == "--" ]]; then
+    shift
+    RUN_CMD=("$@")
+  fi
+else
+  if [[ "$1" == "--" ]]; then
+    shift
+    RUN_CMD=("$@")
+  fi
+fi
+CONTAINER="${CONTAINER:-${DOCKER_RUN_CONTAINER:-robocup_brain_manual}}"
+
+# 若容器未在运行则尝试 start
+if ! docker ps -q -f "name=^${CONTAINER}$" | grep -q .; then
+  echo "[run] Container '$CONTAINER' not running, trying: docker start $CONTAINER"
+  docker start "$CONTAINER" 2>/dev/null || true
+  sleep 1
+fi
+
+if ! docker ps -q -f "name=^${CONTAINER}$" | grep -q .; then
+  echo "[run] Error: Container '$CONTAINER' is not running. Start it first (e.g. docker start $CONTAINER)." >&2
+  exit 1
+fi
+
+# 容器内要 source 的环境
+INIT="source /opt/ros/noetic/setup.bash 2>/dev/null || true; \
+[ -f /workspace/devel/setup.bash ] && source /workspace/devel/setup.bash; \
+export ROS_MASTER_URI=\${ROS_MASTER_URI:-http://localhost:11311}; \
+export ROS_IP=\${ROS_IP:-}; \
+cd /workspace 2>/dev/null || true"
+
+if [[ ${#RUN_CMD[@]} -gt 0 ]]; then
+  # _ 作为 $0，这样 $@ = 要执行的命令及参数
+  docker exec -it "$CONTAINER" bash -c "$INIT; exec \"\${@}\"" _ "${RUN_CMD[@]}"
+else
+  docker exec -it "$CONTAINER" bash -c "$INIT; exec bash"
+fi
