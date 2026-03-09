@@ -21,11 +21,13 @@ workspace_x: [-0.5, 1.0]
 workspace_y: [-0.5, 0.5]
 workspace_z: [0.0, 0.8]
 
-# ACO 参数
+# ACO 参数（方案 A 加速：粗栅格 + 少迭代 + 贪心步 + 精英蚂蚁）
 aco:
-  grid_resolution: 0.02
-  n_ants: 140
-  n_iterations: 60
+  grid_resolution: 0.08
+  n_ants: 40
+  n_iterations: 30
+  greedy_prob: 0.3
+  elite_deposit_ratio: 2.0
   evaporation_rate: 0.5
   pheromone_weight: 1.0
 
@@ -48,5 +50,7 @@ virtual_grasp_point: [0.68, 0.0, 0.55]
 use_virtual_grasp_only: true
 # 是否发布 /joint_states：与 arm_gazebo 同跑时设为 false，避免 TF_REPEATED_DATA
 publish_joint_state: false
+# 是否优先使用 motion_control 的 IK/FK 服务（/motion/compute_ik, /motion/compute_fk），不可用时回退本地
+use_motion_control_kinematics: true
 # 规划完成后保存 Matplotlib PNG（RViz 替代方案）
 save_matplotlib_viz: true

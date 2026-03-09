@@ -50,12 +50,25 @@ docker exec -it path_planning bash -c "source /workspace/scripts/setup_container
    - Marker：Topic `/path_planning/rrt_path`（RRT* 路径，蓝色）
    - Marker：Topic `/path_planning/virtual_grasp_point`（虚拟抓取点，黄色球体）
 
+## 与 motion_control 集成
+
+Path planning 优先使用 **motion_control** 的 IK/FK 服务，不可用时自动回退到本地 DH 实现。
+
+| 接口 | 说明 |
+|------|------|
+| `/motion/compute_ik` | 逆运动学服务 (path_planning/srv/ComputeIK.srv) |
+| `/motion/compute_fk` | 正运动学服务 (path_planning/srv/ComputeFK.srv) |
+| `/motion/ee_pose` | （可选）motion_control 发布的当前末端位姿 PoseStamped |
+
+参数 `use_motion_control_kinematics: true`（默认）启用服务调用。motion_control 需实现上述服务，否则 path_planning 使用本地 IK/FK。
+
 ## 话题
 
 | 订阅 | 说明 |
 |------|------|
 | /camera/depth/points | 3D 点云输入 |
 | /joint_states | 关节状态（可选） |
+| /motion/ee_pose | （可选）motion_control 当前末端位姿 |
 
 | 发布 | 说明 |
 |------|------|
