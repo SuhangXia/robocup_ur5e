@@ -80,7 +80,7 @@ Parameter `use_motion_control_kinematics: true` (default) enables service calls.
 
 ## Configuration (planning_config.yaml)
 
-- `virtual_grasp_point`: Virtual grasp point [x, y, z], default `[0.68, 0.0, 0.55]` (behind the Gazebo box)
+- `virtual_grasp_point`: Virtual grasp point [x, y, z], default `[0.35, 0.0, 0.2]` (table center, table top height)
 - `use_virtual_grasp_only`: When true, planning runs without point cloud (uses Gazebo default obstacles)
 
 ## RViz Won't Start (Troubleshooting)

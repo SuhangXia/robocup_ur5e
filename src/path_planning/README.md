@@ -80,7 +80,7 @@ Path planning 优先使用 **motion_control** 的 IK/FK 服务，不可用时自
 
 ## 配置（planning_config.yaml）
 
-- `virtual_grasp_point`: 虚拟抓取点 [x, y, z]，默认 `[0.68, 0.0, 0.55]`（Gazebo 箱子后方）
+- `virtual_grasp_point`: 虚拟抓取点 [x, y, z]，默认 `[0.35, 0.0, 0.2]`（桌面中心、桌面上表面高度）
 - `use_virtual_grasp_only`: 为 true 时，无点云也执行规划（使用 Gazebo 默认障碍物）
 
 ## RViz 无法启动（故障排除）

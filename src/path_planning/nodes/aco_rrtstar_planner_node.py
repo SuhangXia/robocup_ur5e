@@ -283,6 +283,8 @@ class ACOPhase:
         self.pheromone[start_cell] = tau0
         self.pheromone[goal_cell] = tau0
         self.aco_path_cells = []
+        self.all_paths_cells = []  # 多条候选路径，用于 3D 可视化，最多保留 max_all_paths 条
+        max_all_paths = 50
         goal_xyz_tuple = self._from_cell(goal_cell)
 
         for _ in range(n_iters):
@@ -327,6 +329,9 @@ class ACOPhase:
                         self.pheromone[c] = self.pheromone.get(c, tau0) + deposit
                     if not self.aco_path_cells or len(path) < len(self.aco_path_cells):
                         self.aco_path_cells = path[:]
+                    # 保留多条候选路径供可视化（最多 max_all_paths 条）
+                    self.all_paths_cells.append(path[:])
+                    self.all_paths_cells = self.all_paths_cells[-max_all_paths:]
             # Elite Ant 逻辑：对当前最优路径额外沉积信息素
             if self.aco_path_cells:
                 elite_deposit = (Q / len(self.aco_path_cells)) * (elite_deposit_ratio - 1.0)
@@ -343,6 +348,10 @@ class ACOPhase:
 
     def get_path_xyz(self):
         return [self._from_cell(c) for c in self.aco_path_cells]
+
+    def get_all_paths_xyz(self):
+        """返回多条候选路径（笛卡尔坐标），用于 3D 可视化。"""
+        return [[self._from_cell(c) for c in p] for p in self.all_paths_cells]
 
 
 # =============================================================================
@@ -388,7 +397,10 @@ class RRTStarPhase:
                 return False
         return not check_collision(qb, self.obstacles)
 
-    def plan(self, start, goal):
+    def plan(self, start, goal, return_tree=False):
+        """
+        return_tree: 若为 True，返回 (path, nodes)，其中 nodes 为整棵树 {q: {'cost', 'parent'}}，用于可视化树的所有枝杈。
+        """
         nodes = {start: {'cost': 0, 'parent': None}}
         for _ in range(self.max_iter):
             q_rand = self._sample(goal_bias=0.08)
@@ -421,6 +433,8 @@ class RRTStarPhase:
                 nodes[goal] = {'cost': nodes[q_new]['cost'] + self._dist(q_new, goal), 'parent': q_new}
                 break
         if goal not in nodes:
+            if return_tree:
+                return None, nodes
             return None
         path = []
         p = goal
@@ -429,6 +443,8 @@ class RRTStarPhase:
             p = nodes[p]['parent']
         path.reverse()
         rospy.loginfo("[RRT*] 找到路径，共 %d 个构型", len(path))
+        if return_tree:
+            return path, nodes
         return path
 
 
@@ -509,8 +525,9 @@ GAZEBO_DEFAULT_OBSTACLES = [
     ((0.0, 0.0, -0.06), (1.5, 1.5, 0.01)),
 ]
 
-# 默认虚拟抓取点：Gazebo 箱子的后方 (x>0.55)，桌面上方
-DEFAULT_VIRTUAL_GRASP_POINT = (0.68, 0.0, 0.55)
+# 默认虚拟抓取点：桌面中心（桌面上表面高度），与默认障碍物不重合
+# 取 (0.35, 0.0, 0.2)：桌面中心、z=0.2 桌面上表面
+DEFAULT_VIRTUAL_GRASP_POINT = (0.35, 0.0, 0.2)
 
 
 # =============================================================================
