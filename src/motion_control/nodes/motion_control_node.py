@@ -624,7 +624,7 @@ class MotionControlNode:
     def _move_to_home(self):
         """Move to home configuration (standard joint order)."""
         rospy.loginfo("[MotionControl] Moving to home position...")
-        home_joints = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+        home_joints = [3.4050, -0.4451, 0.1568, -2.8511, -3.1306, 0.2741]
         success = self._execute_joint_motion_impl(home_joints, 4.0)
         if success:
             self._publish_motion_result(GraspResult.SUCCESS, "Home position reached")

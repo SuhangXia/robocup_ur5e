@@ -17,6 +17,7 @@ services:
     volumes:
       - ./src/common_msgs:/workspace/src/common_msgs:ro
       - ./src/robocup_brain:/workspace/src/robocup_brain:ro
+      - ./src/motion_control:/workspace/src/motion_control:ro
       - ./scripts:/workspace/scripts:ro  # 系统脚本
       - /tmp/.X11-unix:/tmp/.X11-unix:rw  # GUI 支持
     restart: unless-stopped
