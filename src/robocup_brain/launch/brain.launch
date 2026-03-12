@@ -2,10 +2,17 @@
 <launch>
   <!-- ROS Master URI 配置 -->
   <arg name="ros_master_uri" default="http://192.168.56.101:11311" />
+  <arg name="start_motion_control" default="true" />
+  <arg name="start_brain" default="false" />
+  <arg name="test_mode" default="false" />
   <param name="ros_master_uri" value="$(arg ros_master_uri)" />
+
+  <!-- Brain 容器启动时一并拉起 motion_control，并在进程退出时自动重启 -->
+  <include file="$(find motion_control)/launch/motion_control.launch" if="$(arg start_motion_control)" />
   
-  <!-- 启动 Brain Node -->
-  <node name="robocup_brain" pkg="robocup_brain" type="brain_node.py" output="screen">
+  <!-- Brain 默认不自动启动，避免干扰 UI 调试；需要时显式传 start_brain:=true -->
+  <node name="robocup_brain" pkg="robocup_brain" type="brain_node.py" output="screen" respawn="true" respawn_delay="2.0" if="$(arg start_brain)">
     <param name="update_rate" value="10.0" />
+    <param name="test_mode" value="$(arg test_mode)" />
   </node>
 </launch>

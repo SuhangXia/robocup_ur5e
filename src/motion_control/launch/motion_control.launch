@@ -5,7 +5,7 @@
   <arg name="base_frame" default="base_link"/>
   <arg name="ee_frame" default="tool0"/>
   
-  <node name="motion_control" pkg="motion_control" type="motion_control_node.py" output="screen">
+  <node name="motion_control" pkg="motion_control" type="motion_control_node.py" output="screen" respawn="true" respawn_delay="2.0">
     <param name="robot_name" value="$(arg robot_name)"/>
     <param name="base_frame" value="$(arg base_frame)"/>
     <param name="ee_frame" value="$(arg ee_frame)"/>

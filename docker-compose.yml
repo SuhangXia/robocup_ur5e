@@ -10,6 +10,8 @@ services:
     image: robocup_ur5e/brain:latest
     container_name: robocup_brain
     network_mode: "host"  # 最小化延迟
+    env_file:
+      - ./scripts/.env
     environment:
       - ROS_MASTER_URI=${ROS_MASTER_URI:-http://localhost:11311}
       - ROS_IP=${ROS_IP:-127.0.0.1}
