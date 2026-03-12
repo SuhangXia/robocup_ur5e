@@ -25,6 +25,14 @@ import tf2_ros
 import tf2_geometry_msgs
 import actionlib
 
+try:
+    import PyKDL
+    from urdf_parser_py.urdf import URDF
+    from kdl_parser_py import urdf as kdl_urdf
+    _HAS_KDL = True
+except ImportError:
+    _HAS_KDL = False
+
 
 class MotionControlNode:
     """
@@ -80,6 +88,21 @@ class MotionControlNode:
         self.tf_buffer = tf2_ros.Buffer()
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         
+        # TCP link: the actual end-effector frame used by UI and IK targets
+        self.tcp_link = rospy.get_param('~tcp_link', 'gripper_tip_link')
+        self.T_tool0_to_tcp = np.eye(4)  # 4x4 fixed transform, updated from TF during init
+
+        # KDL chain for URDF-based FK (preferred over DH parameters)
+        self.kdl_chain = None
+        self.kdl_fk_solver = None
+        self.kdl_jac_solver = None
+        self.kdl_num_joints = 0
+        self._use_kdl = False
+        self._kdl_includes_tcp = True  # True if chain goes all the way to tcp_link
+        self._kdl_joint_names = []     # joint names in KDL chain order
+        self._cfg_to_kdl = []          # mapping: cfg index -> kdl index
+        self._kdl_to_cfg = []          # mapping: kdl index -> cfg index
+
         # MoveIt IK: service, group, planning frame and tip link (must match your MoveIt config)
         self.moveit_ik_service = rospy.get_param('~moveit_ik_service', '/compute_ik')
         self.moveit_ik_group = rospy.get_param('~moveit_ik_group', 'manipulator')
@@ -110,14 +133,23 @@ class MotionControlNode:
                 if name in msg.name:
                     positions.append(msg.position[msg.name.index(name)])
             if len(positions) == self.num_joints:
+                self.current_joint_positions = positions
                 rospy.loginfo("[MotionControl] Communication OK (joint_states received from Gazebo)")
             else:
                 rospy.logwarn("[MotionControl] Communication test: joint_states received but missing joints (got %d, need %d)" % (len(positions), self.num_joints))
         except rospy.ROSException as e:
             rospy.logwarn("[MotionControl] Communication test FAILED: %s. Check Gazebo and /joint_states." % str(e))
         
-        rospy.loginfo("Motion Control Node Ready")
+        # Initialize FK method: prefer KDL (URDF-based), fallback to DH + TF
+        self._init_kdl_chain()
+        if not self._use_kdl:
+            self._init_tool0_to_tcp_transform()
+        
+        rospy.loginfo("Motion Control Node Ready  (FK mode: %s)", "KDL/URDF" if self._use_kdl else "DH+TF")
         rospy.loginfo("=" * 60)
+
+        # Validate FK vs TF at startup
+        self._validate_fk_vs_tf()
 
 
     def _setup_subscribers(self):
@@ -163,6 +195,179 @@ class MotionControlNode:
         """
         pass
 
+    def _validate_fk_vs_tf(self):
+        """Compare FK output against TF to verify kinematic model correctness."""
+        if self.current_joint_positions is None:
+            rospy.logwarn("[MotionControl] No joint positions yet, skipping FK validation")
+            return
+        T_fk = self._fk_gripper_matrix(self.current_joint_positions)
+        if T_fk is None:
+            rospy.logwarn("[MotionControl] FK returned None, skipping validation")
+            return
+        try:
+            trans = self.tf_buffer.lookup_transform(
+                self.base_frame, self.tcp_link, rospy.Time(0), rospy.Duration(2.0))
+            t = trans.transform.translation
+            fk_pos = T_fk[0:3, 3]
+            tf_pos = np.array([t.x, t.y, t.z])
+            diff = np.linalg.norm(fk_pos - tf_pos)
+            rospy.loginfo("[MotionControl] ===== FK vs TF Validation =====")
+            rospy.loginfo("[MotionControl] FK  pos: [%.4f, %.4f, %.4f]", fk_pos[0], fk_pos[1], fk_pos[2])
+            rospy.loginfo("[MotionControl] TF  pos: [%.4f, %.4f, %.4f]", tf_pos[0], tf_pos[1], tf_pos[2])
+            rospy.loginfo("[MotionControl] Position diff: %.6f m", diff)
+            if diff > 0.01:
+                rospy.logerr("[MotionControl] FK vs TF mismatch > 10mm! FK model may be wrong.")
+            else:
+                rospy.loginfo("[MotionControl] FK vs TF OK (< 10mm)")
+            rospy.loginfo("[MotionControl] joints: %s",
+                          ["%.4f" % j for j in self.current_joint_positions])
+        except Exception as e:
+            rospy.logwarn("[MotionControl] FK validation TF lookup failed: %s", e)
+
+    def _init_kdl_chain(self):
+        """Initialize KDL kinematic chain from URDF for FK/Jacobian computation.
+        Tries base_link -> tcp_link first; if joint count doesn't match the 6-DOF arm,
+        falls back to base_link -> ee_frame (tool0) and uses TF for the extra offset."""
+        if not _HAS_KDL:
+            rospy.logwarn("[MotionControl] PyKDL / kdl_parser_py not available, using DH fallback")
+            return
+        try:
+            robot = URDF.from_parameter_server()
+            (ok, tree) = kdl_urdf.treeFromUrdfModel(robot)
+            if not ok:
+                rospy.logerr("[MotionControl] Failed to build KDL tree from URDF")
+                return
+
+            # Prefer direct chain to tcp_link (no extra transform needed)
+            chain = tree.getChain(self.base_frame, self.tcp_link)
+            nj = chain.getNrOfJoints()
+            if nj == self.num_joints:
+                self.kdl_chain = chain
+                self.kdl_num_joints = nj
+                self._kdl_includes_tcp = True
+                rospy.loginfo("[MotionControl] KDL chain OK: %s -> %s (%d joints, direct)",
+                              self.base_frame, self.tcp_link, nj)
+            else:
+                # Extra joints (e.g. gripper finger); use chain to tool0 + TF offset
+                chain2 = tree.getChain(self.base_frame, self.ee_frame)
+                nj2 = chain2.getNrOfJoints()
+                if nj2 == self.num_joints:
+                    self.kdl_chain = chain2
+                    self.kdl_num_joints = nj2
+                    self._kdl_includes_tcp = False
+                    rospy.loginfo("[MotionControl] KDL chain OK: %s -> %s (%d joints, +TF offset to %s)",
+                                  self.base_frame, self.ee_frame, nj2, self.tcp_link)
+                    self._init_tool0_to_tcp_transform()
+                else:
+                    rospy.logwarn("[MotionControl] KDL joint mismatch (tcp=%d, ee=%d, expected=%d), DH fallback",
+                                  nj, nj2, self.num_joints)
+                    return
+
+            # Extract joint names from KDL chain segments (in chain order)
+            # PyKDL uses Joint.None (value 8) for fixed joints, not Joint.Fixed
+            _KDL_JOINT_FIXED = getattr(PyKDL.Joint, 'None', 8)
+            self._kdl_joint_names = []
+            for seg_idx in range(self.kdl_chain.getNrOfSegments()):
+                jnt = self.kdl_chain.getSegment(seg_idx).getJoint()
+                if jnt.getType() != _KDL_JOINT_FIXED:
+                    self._kdl_joint_names.append(jnt.getName())
+            rospy.loginfo("[MotionControl] KDL joint order: %s", self._kdl_joint_names)
+            rospy.loginfo("[MotionControl] Config joint order: %s", list(self.joint_names))
+
+            # Build bidirectional mapping between config order and KDL order
+            self._cfg_to_kdl = []
+            for cfg_name in self.joint_names:
+                if cfg_name in self._kdl_joint_names:
+                    self._cfg_to_kdl.append(self._kdl_joint_names.index(cfg_name))
+                else:
+                    rospy.logerr("[MotionControl] Config joint '%s' not found in KDL chain!", cfg_name)
+                    return
+            self._kdl_to_cfg = [0] * self.kdl_num_joints
+            for cfg_i, kdl_i in enumerate(self._cfg_to_kdl):
+                self._kdl_to_cfg[kdl_i] = cfg_i
+
+            self.kdl_fk_solver = PyKDL.ChainFkSolverPos_recursive(self.kdl_chain)
+            self.kdl_jac_solver = PyKDL.ChainJntToJacSolver(self.kdl_chain)
+            self._use_kdl = True
+        except Exception as e:
+            rospy.logwarn("[MotionControl] KDL init failed: %s, using DH fallback", e)
+
+    def _init_tool0_to_tcp_transform(self):
+        """Get the fixed 4x4 transform from tool0 to tcp_link (e.g. gripper_tip_link) via TF."""
+        if self.tcp_link == self.ee_frame:
+            self.T_tool0_to_tcp = np.eye(4)
+            rospy.loginfo("[MotionControl] tcp_link == ee_frame (%s), no extra transform needed", self.ee_frame)
+            return
+        rospy.loginfo("[MotionControl] Looking up fixed transform: %s -> %s ...", self.ee_frame, self.tcp_link)
+        for attempt in range(20):
+            try:
+                trans = self.tf_buffer.lookup_transform(
+                    self.ee_frame, self.tcp_link, rospy.Time(0), rospy.Duration(1.0)
+                )
+                t = trans.transform.translation
+                r = trans.transform.rotation
+                T = np.eye(4)
+                T[0:3, 0:3] = self._quat_to_rotation_matrix([r.x, r.y, r.z, r.w])
+                T[0, 3], T[1, 3], T[2, 3] = t.x, t.y, t.z
+                self.T_tool0_to_tcp = T
+                rospy.loginfo("[MotionControl] tool0->tcp transform acquired: translation=[%.4f, %.4f, %.4f]",
+                              t.x, t.y, t.z)
+                return
+            except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException):
+                rospy.sleep(0.5)
+        rospy.logwarn("[MotionControl] Could not get %s->%s transform, falling back to identity. "
+                      "Numerical IK may be inaccurate!", self.ee_frame, self.tcp_link)
+        self.T_tool0_to_tcp = np.eye(4)
+
+    def _cfg_to_kdl_jntarray(self, joint_angles: List[float]) -> 'PyKDL.JntArray':
+        """Convert joint_angles (in config/joint_names order) to KDL JntArray (in KDL chain order)."""
+        n = self.kdl_num_joints
+        q = PyKDL.JntArray(n)
+        for cfg_i, kdl_i in enumerate(self._cfg_to_kdl):
+            if cfg_i < len(joint_angles):
+                q[kdl_i] = joint_angles[cfg_i]
+        return q
+
+    def _fk_kdl(self, joint_angles: List[float]) -> Optional[np.ndarray]:
+        """FK via KDL/URDF: joint_angles (config order) -> 4x4 transform (base_link -> tcp_link)."""
+        q = self._cfg_to_kdl_jntarray(joint_angles)
+        frame = PyKDL.Frame()
+        if self.kdl_fk_solver.JntToCart(q, frame) < 0:
+            return None
+        T = np.eye(4)
+        for i in range(3):
+            for j in range(3):
+                T[i, j] = frame.M[i, j]
+        T[0, 3], T[1, 3], T[2, 3] = frame.p.x(), frame.p.y(), frame.p.z()
+        return T
+
+    def _jacobian_kdl(self, joint_angles: List[float]) -> np.ndarray:
+        """6xN Jacobian via KDL. Input: config order. Output: columns in config order."""
+        q = self._cfg_to_kdl_jntarray(joint_angles)
+        n = self.kdl_num_joints
+        jac = PyKDL.Jacobian(n)
+        self.kdl_jac_solver.JntToJac(q, jac)
+        J = np.zeros((6, n))
+        for cfg_i in range(n):
+            kdl_i = self._cfg_to_kdl[cfg_i]
+            for row in range(6):
+                J[row, cfg_i] = jac[row, kdl_i]
+        return J
+
+    def _fk_gripper_matrix(self, joint_angles: List[float]) -> Optional[np.ndarray]:
+        """Forward kinematics returning 4x4 transform: base_link -> tcp_link (gripper_tip_link).
+        Uses KDL (URDF) when available; falls back to DH + tool0->tcp transform."""
+        if self._use_kdl:
+            T = self._fk_kdl(joint_angles)
+            if T is None:
+                return None
+            if not self._kdl_includes_tcp:
+                T = T @ self.T_tool0_to_tcp
+            return T
+        T_tool0 = self._fk_matrix(joint_angles)
+        if T_tool0 is None:
+            return None
+        return T_tool0 @ self.T_tool0_to_tcp
 
     def _rpy_to_quaternion(self, roll: float, pitch: float, yaw: float) -> List[float]:
         """Convert RPY Euler angles to quaternion [qx, qy, qz, qw]"""
@@ -222,10 +427,16 @@ class MotionControlNode:
         axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
         return axis * (angle / (2 * np.sin(angle)))
 
+    def _compute_jacobian(self, q: List[float]) -> np.ndarray:
+        """6xN Jacobian at tcp_link. Uses KDL when available, else numerical finite-differences."""
+        if self._use_kdl:
+            return self._jacobian_kdl(q)
+        return self._compute_jacobian_numerical(q)
+
     def _compute_jacobian_numerical(self, q: List[float], eps: float = 1e-6) -> np.ndarray:
-        """6x6 Jacobian: [linear velocity; angular velocity] w.r.t. joint angles."""
+        """6x6 numerical Jacobian (finite differences) at tcp_link."""
         J = np.zeros((6, self.num_joints))
-        T0 = self._fk_matrix(q)
+        T0 = self._fk_gripper_matrix(q)
         if T0 is None:
             return J
         p0 = T0[0:3, 3]
@@ -233,7 +444,7 @@ class MotionControlNode:
         for j in range(self.num_joints):
             qp = list(q)
             qp[j] += eps
-            T1 = self._fk_matrix(qp)
+            T1 = self._fk_gripper_matrix(qp)
             if T1 is None:
                 continue
             J[0:3, j] = (T1[0:3, 3] - p0) / eps
@@ -313,27 +524,10 @@ class MotionControlNode:
     # =========================================================================
 
     def compute_forward_kinematics(self, joint_angles: List[float]) -> Optional[PoseStamped]:
-        """
-        Compute forward kinematics: joint angles -> end-effector pose (UR5e DH, standard order).
-        """
-        if joint_angles is None or len(joint_angles) != self.num_joints:
+        """Compute FK: joint angles -> tcp_link (gripper_tip_link) pose in base_link."""
+        T = self._fk_gripper_matrix(joint_angles)
+        if T is None:
             return None
-        a = self.dh_params['a']
-        d = self.dh_params['d']
-        alpha = self.dh_params['alpha']
-        offset = self.dh_params['offset']
-        T = np.eye(4)
-        for i in range(6):
-            theta = joint_angles[i] + offset[i]
-            ct, st = np.cos(theta), np.sin(theta)
-            ca, sa = np.cos(alpha[i]), np.sin(alpha[i])
-            A = np.array([
-                [ct, -st*ca, st*sa, a[i]*ct],
-                [st, ct*ca, -ct*sa, a[i]*st],
-                [0, sa, ca, d[i]],
-                [0, 0, 0, 1]
-            ])
-            T = T @ A
         x, y, z = T[0, 3], T[1, 3], T[2, 3]
         roll = np.arctan2(T[2, 1], T[2, 2])
         pitch = np.arctan2(-T[2, 0], np.sqrt(T[2, 1]**2 + T[2, 2]**2))
@@ -413,32 +607,59 @@ class MotionControlNode:
         target_pose: PoseStamped,
         seed_joints: Optional[List[float]] = None
     ) -> Optional[List[float]]:
-        """Numerical IK (Jacobian pseudo-inverse). Used when MoveIt is unavailable or fails."""
+        """Numerical IK (Jacobian pseudo-inverse) for tcp_link (gripper_tip_link).
+        FK uses _fk_gripper_matrix so the solver targets the actual TCP, not tool0.
+        Tries multiple seeds for robustness."""
         T_target = self._pose_to_matrix(target_pose.pose)
         p_target = T_target[0:3, 3]
         R_target = T_target[0:3, 0:3]
+
+        seeds = []
         if seed_joints is not None and len(seed_joints) == self.num_joints:
-            q = list(seed_joints)
-        elif self.current_joint_positions is not None:
-            q = list(self.current_joint_positions)
-        else:
-            q = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
-        step = 0.4
+            seeds.append(list(seed_joints))
+        if self.current_joint_positions is not None:
+            seeds.append(list(self.current_joint_positions))
+        seeds.append([0.0, -1.57, 1.57, -1.57, -1.57, 0.0])
+        if self.current_joint_positions is not None:
+            for offset in [0.3, -0.3, 0.6, -0.6]:
+                seeds.append([j + offset for j in self.current_joint_positions])
+
+        for seed_idx, seed in enumerate(seeds):
+            result = self._ik_iterate(p_target, R_target, list(seed))
+            if result is not None:
+                if seed_idx > 0:
+                    rospy.loginfo("[MotionControl] Numerical IK converged with seed #%d", seed_idx)
+                return result
+
+        rospy.logwarn("[MotionControl] Numerical IK failed with all %d seeds", len(seeds))
+        return None
+
+    def _ik_iterate(self, p_target: np.ndarray, R_target: np.ndarray, q: List[float]) -> Optional[List[float]]:
+        """Single-seed numerical IK iteration (damped least-squares / Levenberg-Marquardt)."""
+        step = 0.5
         pos_tol, ori_tol = 2e-3, 2e-2
-        max_iter = 120
-        lambda_damp = 0.02
-        for _ in range(max_iter):
-            T = self._fk_matrix(q)
+        max_iter = 300
+        lambda_damp = 0.005
+        logged_init = False
+        for it in range(max_iter):
+            T = self._fk_gripper_matrix(q)
             if T is None:
                 return None
             p = T[0:3, 3]
             R = T[0:3, 0:3]
             pos_err = p_target - p
             ori_err = self._rotation_to_axis_angle(R_target @ R.T)
-            err = np.concatenate([pos_err, ori_err])
-            if np.linalg.norm(pos_err) < pos_tol and np.linalg.norm(ori_err) < ori_tol:
+            pe = np.linalg.norm(pos_err)
+            oe = np.linalg.norm(ori_err)
+            if not logged_init:
+                rospy.loginfo("[IK] init err: pos=%.4f m, ori=%.4f rad | target=[%.3f,%.3f,%.3f]",
+                              pe, oe, p_target[0], p_target[1], p_target[2])
+                logged_init = True
+            if pe < pos_tol and oe < ori_tol:
+                rospy.loginfo("[IK] converged at iter %d: pos=%.5f ori=%.5f", it, pe, oe)
                 return q
-            J = self._compute_jacobian_numerical(q)
+            err = np.concatenate([pos_err, ori_err])
+            J = self._compute_jacobian(q)
             try:
                 JJt = J @ J.T + (lambda_damp ** 2) * np.eye(6)
                 dq = J.T @ np.linalg.solve(JJt, err)
@@ -449,9 +670,9 @@ class MotionControlNode:
                 dq = dq * (0.5 / dq_norm)
             q = list(np.array(q) + step * dq)
             for i, name in enumerate(self.joint_names):
-                lo, hi = self.joint_limits.get(name, [-np.pi, np.pi])
+                lo, hi = self.joint_limits.get(name, [-6.28, 6.28])
                 q[i] = np.clip(q[i], lo, hi)
-        rospy.logwarn("[MotionControl] Numerical IK did not converge (max iterations)")
+        rospy.logwarn("[IK] did NOT converge after %d iters: pos=%.4f ori=%.4f", max_iter, pe, oe)
         return None
 
 
@@ -545,7 +766,16 @@ class MotionControlNode:
 
     def _execute_cartesian_motion(self, target_pose: PoseStamped, cmd: MotionCommand):
         """Execute Cartesian motion: IK then joint motion."""
-        rospy.loginfo("[MotionControl] Executing Cartesian motion...")
+        tp = target_pose.pose
+        rospy.loginfo("[MotionControl] Cartesian target (frame=%s): pos=[%.4f,%.4f,%.4f] quat=[%.4f,%.4f,%.4f,%.4f]",
+                      target_pose.header.frame_id,
+                      tp.position.x, tp.position.y, tp.position.z,
+                      tp.orientation.x, tp.orientation.y, tp.orientation.z, tp.orientation.w)
+        if self.current_joint_positions is not None:
+            T_cur = self._fk_gripper_matrix(self.current_joint_positions)
+            if T_cur is not None:
+                rospy.loginfo("[MotionControl] FK(current): pos=[%.4f,%.4f,%.4f]",
+                              T_cur[0, 3], T_cur[1, 3], T_cur[2, 3])
         target_joints = self.compute_inverse_kinematics(target_pose)
         if target_joints is None:
             self._publish_motion_result(GraspResult.EXECUTION_FAILED, "IK failed for target pose")

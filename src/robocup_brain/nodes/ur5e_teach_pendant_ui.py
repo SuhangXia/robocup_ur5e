@@ -137,6 +137,32 @@ class UR5eTeachPendantUI(QMainWindow):
         self.is_moving = True
         self.status_updated_signal.emit("Status: Moving...")
 
+    def _move_in_local_frame(self, dx=0.0, dy=0.0, dz=0.0, droll=0.0, dpitch=0.0, dyaw=0.0):
+        """Move gripper_tip_link in its own local coordinate system.
+        dx/dy/dz: translation along gripper's local X/Y/Z axes (meters).
+        droll/dpitch/dyaw: rotation about gripper's local X/Y/Z axes (radians)."""
+        pose_stamped, _ = self._get_current_pose_from_tf()
+        if pose_stamped is None:
+            self.log("No current pose (TF)")
+            return
+        o = pose_stamped.pose.orientation
+        q_current = [o.x, o.y, o.z, o.w]
+        R_current = tf_trans.quaternion_matrix(q_current)[:3, :3]
+
+        p = pose_stamped.pose.position
+        delta_local = [dx, dy, dz]
+        delta_base = R_current @ delta_local
+        pose_stamped.pose.position.x = p.x + delta_base[0]
+        pose_stamped.pose.position.y = p.y + delta_base[1]
+        pose_stamped.pose.position.z = p.z + delta_base[2]
+
+        if droll != 0.0 or dpitch != 0.0 or dyaw != 0.0:
+            q_delta = tf_trans.quaternion_from_euler(droll, dpitch, dyaw)
+            q_new = tf_trans.quaternion_multiply(q_current, q_delta)
+            pose_stamped.pose.orientation = Quaternion(q_new[0], q_new[1], q_new[2], q_new[3])
+
+        self._send_move_to_pose(pose_stamped)
+
     def init_ui(self):
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -290,113 +316,41 @@ class UR5eTeachPendantUI(QMainWindow):
         self.log(f"Rotation step set: {value:.1f} deg")
 
     def on_x_negative_clicked(self):
-        pose_stamped, _ = self._get_current_pose_from_tf()
-        if pose_stamped is None:
-            self.log("X-: No current pose (TF base_link->tool0)")
-            return
-        pose_stamped.pose.position.x -= self.linear_step
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"X- {-self.linear_step*1000:.1f} mm")
+        self._move_in_local_frame(dx=-self.linear_step)
+        self.log(f"X- {-self.linear_step*1000:.1f} mm (local)")
     def on_x_positive_clicked(self):
-        pose_stamped, _ = self._get_current_pose_from_tf()
-        if pose_stamped is None:
-            self.log("X+: No current pose")
-            return
-        pose_stamped.pose.position.x += self.linear_step
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"X+ +{self.linear_step*1000:.1f} mm")
+        self._move_in_local_frame(dx=self.linear_step)
+        self.log(f"X+ +{self.linear_step*1000:.1f} mm (local)")
     def on_y_negative_clicked(self):
-        pose_stamped, _ = self._get_current_pose_from_tf()
-        if pose_stamped is None:
-            self.log("Y-: No current pose")
-            return
-        pose_stamped.pose.position.y -= self.linear_step
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Y- -{self.linear_step*1000:.1f} mm")
+        self._move_in_local_frame(dy=-self.linear_step)
+        self.log(f"Y- -{self.linear_step*1000:.1f} mm (local)")
     def on_y_positive_clicked(self):
-        pose_stamped, _ = self._get_current_pose_from_tf()
-        if pose_stamped is None:
-            self.log("Y+: No current pose")
-            return
-        pose_stamped.pose.position.y += self.linear_step
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Y+ +{self.linear_step*1000:.1f} mm")
+        self._move_in_local_frame(dy=self.linear_step)
+        self.log(f"Y+ +{self.linear_step*1000:.1f} mm (local)")
     def on_z_negative_clicked(self):
-        pose_stamped, _ = self._get_current_pose_from_tf()
-        if pose_stamped is None:
-            self.log("Z-: No current pose")
-            return
-        pose_stamped.pose.position.z -= self.linear_step
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Z- -{self.linear_step*1000:.1f} mm")
+        self._move_in_local_frame(dz=-self.linear_step)
+        self.log(f"Z- -{self.linear_step*1000:.1f} mm (local)")
     def on_z_positive_clicked(self):
-        pose_stamped, _ = self._get_current_pose_from_tf()
-        if pose_stamped is None:
-            self.log("Z+: No current pose")
-            return
-        pose_stamped.pose.position.z += self.linear_step
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Z+ +{self.linear_step*1000:.1f} mm")
+        self._move_in_local_frame(dz=self.linear_step)
+        self.log(f"Z+ +{self.linear_step*1000:.1f} mm (local)")
     def on_roll_negative_clicked(self):
-        pose_stamped, pose_dict = self._get_current_pose_from_tf()
-        if pose_stamped is None or pose_dict is None:
-            self.log("Roll-: No current pose")
-            return
-        r, p, y = pose_dict['roll'] - self.rotation_step, pose_dict['pitch'], pose_dict['yaw']
-        q = tf_trans.quaternion_from_euler(r, p, y)
-        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Roll- -{self.rotation_step*180/3.14159:.1f} deg")
+        self._move_in_local_frame(droll=-self.rotation_step)
+        self.log(f"Roll- -{self.rotation_step*180/3.14159:.1f} deg (local)")
     def on_roll_positive_clicked(self):
-        pose_stamped, pose_dict = self._get_current_pose_from_tf()
-        if pose_stamped is None or pose_dict is None:
-            self.log("Roll+: No current pose")
-            return
-        r, p, y = pose_dict['roll'] + self.rotation_step, pose_dict['pitch'], pose_dict['yaw']
-        q = tf_trans.quaternion_from_euler(r, p, y)
-        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Roll+ +{self.rotation_step*180/3.14159:.1f} deg")
+        self._move_in_local_frame(droll=self.rotation_step)
+        self.log(f"Roll+ +{self.rotation_step*180/3.14159:.1f} deg (local)")
     def on_pitch_negative_clicked(self):
-        pose_stamped, pose_dict = self._get_current_pose_from_tf()
-        if pose_stamped is None or pose_dict is None:
-            self.log("Pitch-: No current pose")
-            return
-        r, p, y = pose_dict['roll'], pose_dict['pitch'] - self.rotation_step, pose_dict['yaw']
-        q = tf_trans.quaternion_from_euler(r, p, y)
-        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Pitch- -{self.rotation_step*180/3.14159:.1f} deg")
+        self._move_in_local_frame(dpitch=-self.rotation_step)
+        self.log(f"Pitch- -{self.rotation_step*180/3.14159:.1f} deg (local)")
     def on_pitch_positive_clicked(self):
-        pose_stamped, pose_dict = self._get_current_pose_from_tf()
-        if pose_stamped is None or pose_dict is None:
-            self.log("Pitch+: No current pose")
-            return
-        r, p, y = pose_dict['roll'], pose_dict['pitch'] + self.rotation_step, pose_dict['yaw']
-        q = tf_trans.quaternion_from_euler(r, p, y)
-        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Pitch+ +{self.rotation_step*180/3.14159:.1f} deg")
+        self._move_in_local_frame(dpitch=self.rotation_step)
+        self.log(f"Pitch+ +{self.rotation_step*180/3.14159:.1f} deg (local)")
     def on_yaw_negative_clicked(self):
-        pose_stamped, pose_dict = self._get_current_pose_from_tf()
-        if pose_stamped is None or pose_dict is None:
-            self.log("Yaw-: No current pose")
-            return
-        r, p, y = pose_dict['roll'], pose_dict['pitch'], pose_dict['yaw'] - self.rotation_step
-        q = tf_trans.quaternion_from_euler(r, p, y)
-        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Yaw- -{self.rotation_step*180/3.14159:.1f} deg")
+        self._move_in_local_frame(dyaw=-self.rotation_step)
+        self.log(f"Yaw- -{self.rotation_step*180/3.14159:.1f} deg (local)")
     def on_yaw_positive_clicked(self):
-        pose_stamped, pose_dict = self._get_current_pose_from_tf()
-        if pose_stamped is None or pose_dict is None:
-            self.log("Yaw+: No current pose")
-            return
-        r, p, y = pose_dict['roll'], pose_dict['pitch'], pose_dict['yaw'] + self.rotation_step
-        q = tf_trans.quaternion_from_euler(r, p, y)
-        pose_stamped.pose.orientation = Quaternion(q[0], q[1], q[2], q[3])
-        self._send_move_to_pose(pose_stamped)
-        self.log(f"Yaw+ +{self.rotation_step*180/3.14159:.1f} deg")
+        self._move_in_local_frame(dyaw=self.rotation_step)
+        self.log(f"Yaw+ +{self.rotation_step*180/3.14159:.1f} deg (local)")
     def on_home_clicked(self):
         cmd = MotionCommand()
         cmd.command_type = MotionCommand.HOME
