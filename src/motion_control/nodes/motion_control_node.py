@@ -14,6 +14,7 @@ import numpy as np
 from typing import List, Optional, Tuple
 
 from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion
+from std_msgs.msg import Float64MultiArray, Bool
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
@@ -151,6 +152,63 @@ class MotionControlNode:
         # Validate FK vs TF at startup
         self._validate_fk_vs_tf()
 
+        # Compute and publish dexterous workspace bounds (FK sampling)
+        self._publish_workspace_bounds()
+
+    def _compute_workspace_bounds(self, num_samples_per_joint: int = 12) -> Optional[Tuple[float, float, float, float, float, float]]:
+        """
+        Compute dexterous workspace bounds via FK sampling over joint limits.
+        Returns (x_min, x_max, y_min, y_max, z_min, z_max) or None if FK unavailable.
+        """
+        limits = []
+        for name in self.joint_names:
+            lo, hi = self.joint_limits.get(name, [-np.pi, np.pi])
+            limits.append((float(lo), float(hi)))
+        if len(limits) != self.num_joints:
+            return None
+
+        xs, ys, zs = [], [], []
+        # Sample joint space: for each joint, take num_samples values
+        n = num_samples_per_joint
+        for i0 in np.linspace(limits[0][0], limits[0][1], min(n, 8)):
+            for i1 in np.linspace(limits[1][0], limits[1][1], min(n, 8)):
+                for i2 in np.linspace(limits[2][0], limits[2][1], min(n, 6)):
+                    for i3 in np.linspace(limits[3][0], limits[3][1], min(n, 5)):
+                        for i4 in np.linspace(limits[4][0], limits[4][1], min(n, 4)):
+                            for i5 in np.linspace(limits[5][0], limits[5][1], min(n, 4)):
+                                q = [i0, i1, i2, i3, i4, i5]
+                                T = self._fk_gripper_matrix(q)
+                                if T is not None:
+                                    xs.append(T[0, 3])
+                                    ys.append(T[1, 3])
+                                    zs.append(T[2, 3])
+
+        if not xs:
+            return None
+        return (min(xs), max(xs), min(ys), max(ys), min(zs), max(zs))
+
+    def _publish_workspace_bounds(self):
+        """Compute workspace bounds via FK sampling and publish to /motion/workspace_bounds.
+        Intersects FK envelope with conservative UR5e usable region (x>0 in front of base)
+        to avoid IK-unreachable boundary points."""
+        bounds = self._compute_workspace_bounds(num_samples_per_joint=10)
+        if bounds is None:
+            rospy.logwarn("[MotionControl] Workspace bounds computation failed")
+            return
+        x_min, x_max, y_min, y_max, z_min, z_max = bounds
+        # UR5e 保守可用区域：基座前方 x>0，避免 x<0 后方点 IK 失败
+        usable = (0.15, 0.85, -0.55, 0.55, 0.15, 0.90)
+        x_min = max(x_min, usable[0])
+        x_max = min(x_max, usable[1])
+        y_min = max(y_min, usable[2])
+        y_max = min(y_max, usable[3])
+        z_min = max(z_min, usable[4])
+        z_max = min(z_max, usable[5])
+        rospy.loginfo("[MotionControl] Dexterous workspace (usable): X[%.3f,%.3f] Y[%.3f,%.3f] Z[%.3f,%.3f]",
+                      x_min, x_max, y_min, y_max, z_min, z_max)
+        msg = Float64MultiArray()
+        msg.data = [x_min, x_max, y_min, y_max, z_min, z_max]
+        self.workspace_bounds_pub.publish(msg)
 
     def _setup_subscribers(self):
         """Setup ROS subscribers"""
@@ -168,6 +226,13 @@ class MotionControlNode:
             queue_size=10
         )
 
+        self.capture_result_sub = rospy.Subscriber(
+            '/camera/capture_result',
+            Bool,
+            self._capture_result_callback,
+            queue_size=10
+        )
+
 
     def _setup_publishers(self):
         """Setup ROS publishers"""
@@ -181,6 +246,13 @@ class MotionControlNode:
             '/joint_trajectory',
             JointTrajectory,
             queue_size=10
+        )
+
+        self.workspace_bounds_pub = rospy.Publisher(
+            '/motion/workspace_bounds',
+            Float64MultiArray,
+            queue_size=1,
+            latch=True
         )
 
 
@@ -480,6 +552,12 @@ class MotionControlNode:
             self.current_joint_positions = positions
             self.current_ee_pose = self.compute_forward_kinematics(positions)
 
+    def _capture_result_callback(self, msg: Bool):
+        """收到相机拍照结果，在终端打印"""
+        if msg.data:
+            rospy.loginfo("[MotionControl] Successful Shot")
+        else:
+            rospy.logwarn("[MotionControl] Failed")
 
     def motion_command_callback(self, msg: MotionCommand):
         """
