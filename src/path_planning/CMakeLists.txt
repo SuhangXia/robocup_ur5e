@@ -10,6 +10,21 @@ find_package(catkin REQUIRED COMPONENTS
   moveit_msgs
   trajectory_msgs
   common_msgs
+  message_generation
+)
+
+## 运动学服务接口 (供 motion_control 实现)
+add_service_files(
+  FILES
+  ComputeIK.srv
+  ComputeFK.srv
+)
+
+generate_messages(
+  DEPENDENCIES
+  std_msgs
+  geometry_msgs
+  sensor_msgs
 )
 
 catkin_package(
@@ -22,11 +37,13 @@ catkin_package(
     moveit_msgs
     trajectory_msgs
     common_msgs
+    message_runtime
 )
 
 catkin_install_python(PROGRAMS
   nodes/aco_rrtstar_planner_node.py
   nodes/test_aco_rrtstar.py
+  nodes/demo_one_shot_planning.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
