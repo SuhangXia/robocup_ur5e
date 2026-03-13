@@ -42,6 +42,7 @@ catkin_package(
 
 catkin_install_python(PROGRAMS
   nodes/aco_rrtstar_planner_node.py
+  nodes/Planner_Scene.py
   nodes/test_aco_rrtstar.py
   nodes/demo_one_shot_planning.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
