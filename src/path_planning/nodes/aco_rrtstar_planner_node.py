@@ -6,6 +6,7 @@ ACO+RRT* 混合规划节点
 - 支持虚拟抓取点：在任意位置（默认：Gazebo 桌面上箱子后方）进行路径规划
 - 在 RViz 中可视化障碍物、ACO 路径、RRT* 路径、虚拟抓取点
 - 机械臂站位与 Gazebo 相同 (x=-0.10, y=0, z=0.615)
+- IK/FK 优先订阅 motion_control 的 ROS 服务，不可用时回退到本地计算
 """
 
 import rospy
@@ -23,12 +24,19 @@ except ImportError:
 from sensor_msgs.msg import PointCloud2, JointState
 import sensor_msgs.point_cloud2 as pc2
 from visualization_msgs.msg import Marker, MarkerArray
-from geometry_msgs.msg import Point
+from geometry_msgs.msg import Point, PoseStamped
 from std_msgs.msg import ColorRGBA, Header
+
+# motion_control 运动学服务 (可选)
+try:
+    from path_planning.srv import ComputeIK, ComputeFK
+    HAS_KINEMATICS_SRV = True
+except ImportError:
+    HAS_KINEMATICS_SRV = False
 
 
 # =============================================================================
-# UR5e 前向运动学 (DH 参数)
+# UR5e 前向运动学 (DH 参数) - 本地备用实现
 # =============================================================================
 class UR5eFK:
     DH = [
@@ -70,10 +78,11 @@ class UR5eFK:
         return poses
 
 
-def ik_target(target_xyz, q_init=None, joint_limits=None):
+def ik_target_local(target_xyz, q_init=None, joint_limits=None):
     """
-    数值 IK：求关节角使末端到达 target_xyz [x,y,z]
+    本地数值 IK：求关节角使末端到达 target_xyz [x,y,z]
     使用 scipy.minimize 最小化 ||FK(q) - target||^2
+    当 motion_control 的 IK 服务不可用时使用
     """
     if joint_limits is None:
         joint_limits = [(-2*pi, 2*pi)] * 6
@@ -92,6 +101,80 @@ def ik_target(target_xyz, q_init=None, joint_limits=None):
         if res.fun < 1e-4:
             return tuple(res.x)
     return None
+
+
+# =============================================================================
+# KinematicsClient: 优先使用 motion_control 服务，不可用时回退本地
+# =============================================================================
+class KinematicsClient:
+    """封装 IK/FK 调用：优先 motion_control 服务，回退本地计算"""
+    IK_SERVICE = '/motion/compute_ik'
+    FK_SERVICE = '/motion/compute_fk'
+    EE_POSE_TOPIC = '/motion/ee_pose'
+
+    def __init__(self, use_motion_control=True):
+        self.use_motion_control = use_motion_control
+        self._ik_proxy = None
+        self._fk_proxy = None
+        self._ee_pose = None  # 订阅 motion_control 发布的当前末端位姿
+
+        if use_motion_control and HAS_KINEMATICS_SRV:
+            try:
+                rospy.wait_for_service(self.IK_SERVICE, timeout=2.0)
+                self._ik_proxy = rospy.ServiceProxy(self.IK_SERVICE, ComputeIK)
+                rospy.loginfo("[ACO+RRT*] 已连接 motion_control IK 服务: %s", self.IK_SERVICE)
+            except (rospy.ROSException, rospy.ROSInterruptException):
+                rospy.logwarn("[ACO+RRT*] motion_control IK 服务不可用，使用本地 IK")
+            try:
+                rospy.wait_for_service(self.FK_SERVICE, timeout=2.0)
+                self._fk_proxy = rospy.ServiceProxy(self.FK_SERVICE, ComputeFK)
+                rospy.loginfo("[ACO+RRT*] 已连接 motion_control FK 服务: %s", self.FK_SERVICE)
+            except (rospy.ROSException, rospy.ROSInterruptException):
+                rospy.logwarn("[ACO+RRT*] motion_control FK 服务不可用，使用本地 FK")
+
+    def ik(self, target_xyz):
+        """目标笛卡尔坐标 [x,y,z] -> 关节角 tuple 或 None"""
+        if self._ik_proxy is not None:
+            try:
+                req = ComputeIK.Request()
+                req.target_pose = PoseStamped()
+                req.target_pose.header.frame_id = 'base_link'
+                req.target_pose.header.stamp = rospy.Time.now()
+                req.target_pose.pose.position.x = float(target_xyz[0])
+                req.target_pose.pose.position.y = float(target_xyz[1])
+                req.target_pose.pose.position.z = float(target_xyz[2])
+                req.target_pose.pose.orientation.w = 1.0
+                resp = self._ik_proxy(req)
+                if resp.success and resp.solution.position:
+                    return tuple(resp.solution.position[:6])
+            except Exception as e:
+                rospy.logdebug_throttle(5, "[ACO+RRT*] IK 服务调用失败: %s", str(e))
+        return ik_target_local(target_xyz)
+
+    def fk(self, joints):
+        """关节角 -> 末端位置 [x,y,z] (仅位置)"""
+        if self._fk_proxy is not None:
+            try:
+                req = ComputeFK.Request()
+                req.joint_state = JointState()
+                req.joint_state.name = ['shoulder_pan_joint', 'shoulder_lift_joint', 'elbow_joint',
+                                        'wrist_1_joint', 'wrist_2_joint', 'wrist_3_joint']
+                req.joint_state.position = list(joints)[:6]
+                resp = self._fk_proxy(req)
+                if resp.success and resp.ee_pose.pose.position:
+                    p = resp.ee_pose.pose.position
+                    return np.array([p.x, p.y, p.z])
+            except Exception as e:
+                rospy.logdebug_throttle(5, "[ACO+RRT*] FK 服务调用失败: %s", str(e))
+        return np.array(UR5eFK.fk(joints))
+
+    def get_current_ee_pose(self):
+        """获取 motion_control 发布的当前末端位姿 (若已订阅)"""
+        return self._ee_pose
+
+    def set_current_ee_pose(self, pose):
+        """由订阅回调设置"""
+        self._ee_pose = pose
 
 
 def point_in_aabb(p, center, half_extents):
@@ -183,7 +266,13 @@ class ACOPhase:
                 if bx[0] <= gx <= bx[1] and by[0] <= gy <= by[1] and bz[0] <= gz <= bz[1]:
                     yield n
 
-    def run(self, start_xyz, goal_xyz, n_ants=30, n_iters=50, rho=0.75, Q=1.0):
+    def run(self, start_xyz, goal_xyz, n_ants=30, n_iters=50, rho=0.75, Q=1.0,
+            greedy_prob=0.3, elite_deposit_ratio=2.0):
+        """
+        ACO 主循环。
+        greedy_prob: 贪心步概率，约此概率下选择到 goal 最近的邻居
+        elite_deposit_ratio: 精英路径额外沉积倍数（相对普通蚂蚁）
+        """
         start_cell = self._to_cell(*start_xyz)
         goal_cell = self._to_cell(*goal_xyz)
         for c in [start_cell, goal_cell]:
@@ -194,6 +283,9 @@ class ACOPhase:
         self.pheromone[start_cell] = tau0
         self.pheromone[goal_cell] = tau0
         self.aco_path_cells = []
+        self.all_paths_cells = []  # 多条候选路径，用于 3D 可视化，最多保留 max_all_paths 条
+        max_all_paths = 50
+        goal_xyz_tuple = self._from_cell(goal_cell)
 
         for _ in range(n_iters):
             for _ in range(n_ants):
@@ -204,20 +296,29 @@ class ACOPhase:
                     ns = list(self._neighbors(current))
                     if not ns:
                         break
-                    probs = []
-                    for n in ns:
-                        tau = self.pheromone.get(n, tau0)
-                        eta = 1.0 / (1.0 + sqrt(sum((a-b)**2 for a,b in zip(
-                            self._from_cell(n), self._from_cell(goal_cell)))))
-                        probs.append(tau ** 1.0 * eta ** 2.0)
-                    s = sum(probs)
-                    probs = [p/s for p in probs]
-                    r = random.random()
-                    for i, p in enumerate(probs):
-                        r -= p
-                        if r <= 0:
-                            current = ns[i]
-                            break
+                    ns_unvisited = [n for n in ns if n not in visited]
+                    if not ns_unvisited:
+                        break
+                    # 贪心步：约 greedy_prob 概率选择到 goal 最近的未访问邻居
+                    if random.random() < greedy_prob:
+                        current = min(ns_unvisited, key=lambda n: sum(
+                            (a - b) ** 2 for a, b in zip(
+                                self._from_cell(n), goal_xyz_tuple)))
+                    else:
+                        probs = []
+                        for n in ns_unvisited:
+                            tau = self.pheromone.get(n, tau0)
+                            eta = 1.0 / (1.0 + sqrt(sum((a - b) ** 2 for a, b in zip(
+                                self._from_cell(n), goal_xyz_tuple))))
+                            probs.append(tau ** 1.0 * eta ** 2.0)
+                        s = sum(probs)
+                        probs = [p / s for p in probs]
+                        r = random.random()
+                        for i, p in enumerate(probs):
+                            r -= p
+                            if r <= 0:
+                                current = ns[i]
+                                break
                     if current in visited:
                         break
                     visited.add(current)
@@ -228,6 +329,14 @@ class ACOPhase:
                         self.pheromone[c] = self.pheromone.get(c, tau0) + deposit
                     if not self.aco_path_cells or len(path) < len(self.aco_path_cells):
                         self.aco_path_cells = path[:]
+                    # 保留多条候选路径供可视化（最多 max_all_paths 条）
+                    self.all_paths_cells.append(path[:])
+                    self.all_paths_cells = self.all_paths_cells[-max_all_paths:]
+            # Elite Ant 逻辑：对当前最优路径额外沉积信息素
+            if self.aco_path_cells:
+                elite_deposit = (Q / len(self.aco_path_cells)) * (elite_deposit_ratio - 1.0)
+                for c in self.aco_path_cells:
+                    self.pheromone[c] = self.pheromone.get(c, tau0) + elite_deposit
             for c in list(self.pheromone.keys()):
                 if c not in self.obstacle_cells:
                     self.pheromone[c] = max(tau0 * 0.1, self.pheromone[c] * rho)
@@ -239,6 +348,10 @@ class ACOPhase:
 
     def get_path_xyz(self):
         return [self._from_cell(c) for c in self.aco_path_cells]
+
+    def get_all_paths_xyz(self):
+        """返回多条候选路径（笛卡尔坐标），用于 3D 可视化。"""
+        return [[self._from_cell(c) for c in p] for p in self.all_paths_cells]
 
 
 # =============================================================================
@@ -284,7 +397,10 @@ class RRTStarPhase:
                 return False
         return not check_collision(qb, self.obstacles)
 
-    def plan(self, start, goal):
+    def plan(self, start, goal, return_tree=False):
+        """
+        return_tree: 若为 True，返回 (path, nodes)，其中 nodes 为整棵树 {q: {'cost', 'parent'}}，用于可视化树的所有枝杈。
+        """
         nodes = {start: {'cost': 0, 'parent': None}}
         for _ in range(self.max_iter):
             q_rand = self._sample(goal_bias=0.08)
@@ -317,6 +433,8 @@ class RRTStarPhase:
                 nodes[goal] = {'cost': nodes[q_new]['cost'] + self._dist(q_new, goal), 'parent': q_new}
                 break
         if goal not in nodes:
+            if return_tree:
+                return None, nodes
             return None
         path = []
         p = goal
@@ -325,6 +443,8 @@ class RRTStarPhase:
             p = nodes[p]['parent']
         path.reverse()
         rospy.loginfo("[RRT*] 找到路径，共 %d 个构型", len(path))
+        if return_tree:
+            return path, nodes
         return path
 
 
@@ -368,10 +488,13 @@ def create_path_marker(points_xyz, frame_id, ns, color, marker_id=0):
     return m
 
 
-def create_joint_path_marker(path_joints, frame_id, ns, color, marker_id=0):
-    """path_joints: list of 6-tuples, 转为 workspace 路径点"""
-    xyz = [UR5eFK.fk(q) for q in path_joints]
-    return create_path_marker([tuple(p) for p in xyz], frame_id, ns, color, marker_id)
+def create_joint_path_marker(path_joints, frame_id, ns, color, marker_id=0, kinematics_client=None):
+    """path_joints: list of 6-tuples, 转为 workspace 路径点，优先使用 kinematics_client"""
+    if kinematics_client is not None:
+        xyz = [tuple(kinematics_client.fk(q)) for q in path_joints]
+    else:
+        xyz = [tuple(UR5eFK.fk(q)) for q in path_joints]
+    return create_path_marker(xyz, frame_id, ns, color, marker_id)
 
 
 def create_grasp_point_marker(x, y, z, frame_id, marker_id=0):
@@ -402,8 +525,9 @@ GAZEBO_DEFAULT_OBSTACLES = [
     ((0.0, 0.0, -0.06), (1.5, 1.5, 0.01)),
 ]
 
-# 默认虚拟抓取点：Gazebo 箱子的后方 (x>0.55)，桌面上方
-DEFAULT_VIRTUAL_GRASP_POINT = (0.68, 0.0, 0.55)
+# 默认虚拟抓取点：桌面中心（桌面上表面高度），与默认障碍物不重合
+# 取 (0.35, 0.0, 0.2)：桌面中心、z=0.2 桌面上表面
+DEFAULT_VIRTUAL_GRASP_POINT = (0.35, 0.0, 0.2)
 
 
 # =============================================================================
@@ -471,6 +595,16 @@ class ACO_RRTStarPlannerNode:
         self.use_virtual_grasp_only = rospy.get_param('~use_virtual_grasp_only', True)
         self.publish_joint_state_enabled = rospy.get_param('~publish_joint_state', False)
         self.save_matplotlib_viz = rospy.get_param('~save_matplotlib_viz', True)
+        use_motion_control = rospy.get_param('~use_motion_control_kinematics', True)
+        self.kinematics_client = KinematicsClient(use_motion_control=use_motion_control)
+        # 可选：订阅 motion_control 发布的当前末端位姿
+        try:
+            rospy.Subscriber(self.kinematics_client.EE_POSE_TOPIC, PoseStamped,
+                             lambda msg: self.kinematics_client.set_current_ee_pose(msg), queue_size=1)
+            rospy.loginfo_throttle(60, "[ACO+RRT*] 已订阅 motion_control EE 位姿: %s",
+                                  self.kinematics_client.EE_POSE_TOPIC)
+        except Exception:
+            pass
         rospy.Subscriber(self.pointcloud_topic, PointCloud2, self.pointcloud_cb, queue_size=1)
         if self.publish_joint_state_enabled:
             rospy.Timer(rospy.Duration(0.1), self.publish_joint_state)
@@ -486,8 +620,8 @@ class ACO_RRTStarPlannerNode:
         self.run_planning()
 
     def _compute_goal_from_grasp_point(self):
-        """从虚拟抓取点 (x,y,z) 通过 IK 计算目标关节角"""
-        q = ik_target(self.virtual_grasp_point)
+        """从虚拟抓取点 (x,y,z) 通过 IK 计算目标关节角，优先使用 motion_control"""
+        q = self.kinematics_client.ik(self.virtual_grasp_point)
         if q is not None:
             rospy.loginfo("[ACO+RRT*] IK 成功，目标关节: %s", list(q))
             return list(q)
@@ -518,12 +652,12 @@ class ACO_RRTStarPlannerNode:
 
         start = tuple(self.home_joints)
         goal = tuple(self.goal_joints)
-        start_xyz = UR5eFK.fk(start)
-        goal_xyz = UR5eFK.fk(goal)
+        start_xyz = self.kinematics_client.fk(start)
+        goal_xyz = self.kinematics_client.fk(goal)
 
-        aco = ACOPhase(grid_res=0.04, bounds=self.bounds)
+        aco = ACOPhase(grid_res=0.08, bounds=self.bounds)
         aco.mark_obstacles(self.obstacles)
-        aco.run(start_xyz, goal_xyz, n_ants=100, n_iters=80)
+        aco.run(start_xyz, goal_xyz, n_ants=40, n_iters=30, greedy_prob=0.3, elite_deposit_ratio=2.0)
 
         pheromone_fn = lambda x, y, z: aco.get_pheromone(x, y, z)
         rrt = RRTStarPhase(self.obstacles, pheromone_fn, step_size=0.12, max_iter=4000)
@@ -545,8 +679,9 @@ class ACO_RRTStarPlannerNode:
             if _dir not in sys.path:
                 sys.path.insert(0, _dir)
             from plot_path_planning import plot_planning_results
-            rrt_xyz = [UR5eFK.fk(q) for q in self.rrt_path_joints] if self.rrt_path_joints else []
-            start_xyz = tuple(UR5eFK.fk(self.home_joints))
+            kc = self.kinematics_client
+            rrt_xyz = [tuple(kc.fk(q)) for q in self.rrt_path_joints] if self.rrt_path_joints else []
+            start_xyz = tuple(kc.fk(self.home_joints))
             out = rospy.get_param('~matplotlib_viz_output', '/workspace/viz_output/path_planning.png')
             plot_planning_results(
                 self.obstacles, self.aco_path_xyz or [], rrt_xyz,
@@ -575,7 +710,7 @@ class ACO_RRTStarPlannerNode:
             self.aco_path_pub.publish(m)
         if hasattr(self, 'rrt_path_joints') and self.rrt_path_joints:
             m = create_joint_path_marker(self.rrt_path_joints, self.frame_id, 'rrtstar',
-                                        ColorRGBA(0, 0, 1, 1))
+                                        ColorRGBA(0, 0, 1, 1), kinematics_client=self.kinematics_client)
             self.rrt_path_pub.publish(m)
 
     def run(self):
