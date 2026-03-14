@@ -141,6 +141,8 @@ services:
     volumes:
       - ./src/common_msgs:/workspace/src/common_msgs:ro
       - ./src/path_planning:/workspace/src/path_planning:ro
+      - ./third_party/ros/universal_robot/ur_description:/workspace/src/ur_description:ro
+      - ./third_party/ros/robotiq/robotiq_description:/workspace/src/robotiq_description:ro
       - ./scripts:/workspace/scripts:ro
       - ./path_planning_viz:/workspace/viz_output:rw
       - /tmp/.X11-unix:/tmp/.X11-unix:rw

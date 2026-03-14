@@ -11,19 +11,28 @@ Responsibilities:
 
 import rospy
 import numpy as np
+import copy
+import threading
 from typing import List, Optional, Tuple
 
 from geometry_msgs.msg import PoseStamped, Pose, Point, Quaternion
 from sensor_msgs.msg import JointState
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
-from common_msgs.msg import MotionCommand, GraspResult
+from common_msgs.msg import (
+    MotionCommand,
+    GraspResult,
+    ExecuteTrajectoryAction,
+    ExecuteTrajectoryResult,
+    ExecuteTrajectoryFeedback,
+)
 from moveit_msgs.srv import GetPositionIK
 from moveit_msgs.msg import PositionIKRequest, RobotState, MoveItErrorCodes
 
 import tf2_ros
 import tf2_geometry_msgs
 import actionlib
+import actionlib_msgs.msg as action_msgs
 
 
 class MotionControlNode:
@@ -75,6 +84,17 @@ class MotionControlNode:
             'wrist_2_joint': [-np.pi, np.pi],
             'wrist_3_joint': [-np.pi, np.pi]
         }
+        self.home_joints = rospy.get_param(
+            '~home_position',
+            [0.0, -1.57, 1.57, -1.57, -1.57, 0.0],
+        )
+        if len(self.home_joints) != self.num_joints:
+            rospy.logwarn(
+                "[MotionControl] Invalid ~home_position length %d, falling back to default.",
+                len(self.home_joints),
+            )
+            self.home_joints = [0.0, -1.57, 1.57, -1.57, -1.57, 0.0]
+        self.home_joints = [float(v) for v in self.home_joints]
         
         # TF2 for transformations
         self.tf_buffer = tf2_ros.Buffer()
@@ -86,6 +106,8 @@ class MotionControlNode:
         self.moveit_planning_frame = rospy.get_param('~moveit_planning_frame', 'world')
         self.moveit_ik_link = rospy.get_param('~moveit_ik_link', 'gripper_tip_link')
         self._moveit_ik_proxy = None  # lazy init when first needed
+        self._execution_lock = threading.RLock()
+        self._active_execution_source = None
 
         # Action client for trajectory execution (Gazebo UR5e controller)
         self.trajectory_client = actionlib.SimpleActionClient(
@@ -100,6 +122,7 @@ class MotionControlNode:
         self._setup_subscribers()
         self._setup_publishers()
         self._setup_services()
+        self._setup_action_servers()
         
         # Communication test: wait for first joint_states from Gazebo
         rospy.loginfo("[MotionControl] Communication test: waiting for /joint_states (timeout 10s)...")
@@ -162,6 +185,33 @@ class MotionControlNode:
         - Jacobian service: compute Jacobian matrix
         """
         pass
+
+    def _setup_action_servers(self):
+        self.execute_trajectory_server = actionlib.SimpleActionServer(
+            '/motion_control/execute_trajectory',
+            ExecuteTrajectoryAction,
+            execute_cb=self._execute_trajectory_action_cb,
+            auto_start=False,
+        )
+        self.execute_trajectory_server.start()
+
+    def _try_begin_execution(self, source: str):
+        with self._execution_lock:
+            if self._active_execution_source is not None:
+                return False, self._active_execution_source
+            self._active_execution_source = source
+            return True, None
+
+    def _finish_execution(self, source: str):
+        with self._execution_lock:
+            if self._active_execution_source == source:
+                self._active_execution_source = None
+
+    def _publish_execute_feedback(self, stage: int, message: str):
+        feedback = ExecuteTrajectoryFeedback()
+        feedback.stage = stage
+        feedback.message = message
+        self.execute_trajectory_server.publish_feedback(feedback)
 
 
     def _rpy_to_quaternion(self, roll: float, pitch: float, yaw: float) -> List[float]:
@@ -284,7 +334,20 @@ class MotionControlNode:
         - Publish result
         """
         rospy.loginfo(f"[MotionControl] Received command: {msg.command_type}")
-        
+
+        if msg.command_type == MotionCommand.STOP:
+            self._stop_motion()
+            return
+
+        execution_source = f"topic:{msg.command_type}"
+        ok, active_source = self._try_begin_execution(execution_source)
+        if not ok:
+            self._publish_motion_result(
+                GraspResult.EXECUTION_FAILED,
+                f"Motion controller busy: {active_source}",
+            )
+            return
+
         try:
             if msg.command_type == MotionCommand.MOVE_TO_POSE:
                 self._execute_cartesian_motion(msg.target_pose, msg)
@@ -295,9 +358,9 @@ class MotionControlNode:
                 else:
                     self._execute_joint_motion(joints, msg)
             elif msg.command_type == MotionCommand.EXECUTE_TRAJECTORY:
-                self._execute_trajectory(msg.trajectory)
-            elif msg.command_type == MotionCommand.STOP:
-                self._stop_motion()
+                success, _status, message = self._execute_trajectory_sync(msg.trajectory)
+                result_status = GraspResult.SUCCESS if success else GraspResult.EXECUTION_FAILED
+                self._publish_motion_result(result_status, message)
             elif msg.command_type == MotionCommand.HOME:
                 self._move_to_home()
             else:
@@ -306,6 +369,8 @@ class MotionControlNode:
         except Exception as e:
             rospy.logerr(f"[MotionControl] Motion execution failed: {e}")
             self._publish_motion_result(GraspResult.EXECUTION_FAILED, str(e))
+        finally:
+            self._finish_execution(execution_source)
 
 
     # =========================================================================
@@ -598,22 +663,112 @@ class MotionControlNode:
         rospy.logerr("[MotionControl] Motion timed out")
         return False
 
-    def _execute_trajectory(self, trajectory: JointTrajectory):
-        """Execute pre-computed trajectory."""
+    def _scale_trajectory_timing(self, trajectory: JointTrajectory, max_velocity: float, max_acceleration: float):
+        """Apply coarse time scaling to a trajectory based on velocity/acceleration factors."""
+        command = copy.deepcopy(trajectory)
+        scale_factors = [1.0]
+
+        if 0.0 < max_velocity < 1.0:
+            scale_factors.append(1.0 / max_velocity)
+        if 0.0 < max_acceleration < 1.0:
+            scale_factors.append(1.0 / np.sqrt(max_acceleration))
+
+        time_scale = max(scale_factors)
+        if time_scale <= 1.0:
+            return command
+
+        for point in command.points:
+            point.time_from_start = rospy.Duration(point.time_from_start.to_sec() * time_scale)
+            if point.velocities:
+                point.velocities = [value / time_scale for value in point.velocities]
+            if point.accelerations:
+                point.accelerations = [value / (time_scale ** 2) for value in point.accelerations]
+        return command
+
+    def _execute_trajectory_sync(
+        self,
+        trajectory: JointTrajectory,
+        max_velocity: float = 1.0,
+        max_acceleration: float = 1.0,
+        preempt_check=None,
+        feedback_cb=None,
+    ):
+        """Execute a pre-computed trajectory and return (success, status, message)."""
         rospy.loginfo("[MotionControl] Executing trajectory...")
         if len(trajectory.points) == 0:
-            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Empty trajectory")
-            return
-        if not trajectory.joint_names:
-            trajectory.joint_names = self.joint_names
+            return False, ExecuteTrajectoryResult.INVALID_TRAJECTORY, "Empty trajectory"
+
+        if not self.trajectory_client.wait_for_server(timeout=rospy.Duration(1.0)):
+            return False, ExecuteTrajectoryResult.EXECUTION_FAILED, "Trajectory action server unavailable"
+
+        command = self._scale_trajectory_timing(trajectory, max_velocity, max_acceleration)
+        if not command.joint_names:
+            command.joint_names = self.joint_names
         goal = FollowJointTrajectoryGoal()
-        goal.trajectory = trajectory
+        goal.trajectory = command
         self.trajectory_client.send_goal(goal)
-        if self.trajectory_client.wait_for_result(timeout=rospy.Duration(60.0)):
-            self._publish_motion_result(GraspResult.SUCCESS, "Trajectory completed")
-        else:
-            self.trajectory_client.cancel_goal()
-            self._publish_motion_result(GraspResult.EXECUTION_FAILED, "Trajectory failed")
+        if feedback_cb is not None:
+            feedback_cb(ExecuteTrajectoryFeedback.EXECUTING, "Trajectory executing")
+
+        timeout_sec = max(60.0, command.points[-1].time_from_start.to_sec() + 5.0)
+        start_time = rospy.Time.now()
+
+        while not rospy.is_shutdown():
+            if preempt_check is not None and preempt_check():
+                self.trajectory_client.cancel_goal()
+                return False, ExecuteTrajectoryResult.PREEMPTED, "Trajectory execution preempted"
+
+            if self.trajectory_client.wait_for_result(timeout=rospy.Duration(0.1)):
+                state = self.trajectory_client.get_state()
+                if state == action_msgs.GoalStatus.SUCCEEDED:
+                    return True, ExecuteTrajectoryResult.SUCCEEDED, "Trajectory completed"
+                return False, ExecuteTrajectoryResult.EXECUTION_FAILED, (
+                    f"Trajectory failed with controller state {state}"
+                )
+
+            if (rospy.Time.now() - start_time).to_sec() > timeout_sec:
+                self.trajectory_client.cancel_goal()
+                return False, ExecuteTrajectoryResult.EXECUTION_FAILED, "Trajectory failed (timeout)"
+
+        self.trajectory_client.cancel_goal()
+        return False, ExecuteTrajectoryResult.PREEMPTED, "Trajectory execution interrupted"
+
+    def _execute_trajectory_action_cb(self, goal):
+        execution_source = "action:execute_trajectory"
+        ok, active_source = self._try_begin_execution(execution_source)
+        result = ExecuteTrajectoryResult()
+
+        if not ok:
+            result.success = False
+            result.status = ExecuteTrajectoryResult.BUSY
+            result.message = f"Motion controller busy: {active_source}"
+            self.execute_trajectory_server.set_aborted(result, result.message)
+            return
+
+        try:
+            self._publish_execute_feedback(ExecuteTrajectoryFeedback.ACCEPTED, "Trajectory accepted")
+            success, status, message = self._execute_trajectory_sync(
+                goal.trajectory,
+                max_velocity=goal.max_velocity,
+                max_acceleration=goal.max_acceleration,
+                preempt_check=self.execute_trajectory_server.is_preempt_requested,
+                feedback_cb=self._publish_execute_feedback,
+            )
+            result.success = success
+            result.status = status
+            result.message = message
+
+            motion_status = GraspResult.SUCCESS if success else GraspResult.EXECUTION_FAILED
+            self._publish_motion_result(motion_status, message)
+
+            if status == ExecuteTrajectoryResult.PREEMPTED:
+                self.execute_trajectory_server.set_preempted(result, message)
+            elif success:
+                self.execute_trajectory_server.set_succeeded(result, message)
+            else:
+                self.execute_trajectory_server.set_aborted(result, message)
+        finally:
+            self._finish_execution(execution_source)
 
     def _stop_motion(self):
         """Emergency stop: cancel all goals."""
@@ -624,8 +779,7 @@ class MotionControlNode:
     def _move_to_home(self):
         """Move to home configuration (standard joint order)."""
         rospy.loginfo("[MotionControl] Moving to home position...")
-        home_joints = [3.4050, -0.4451, 0.1568, -2.8511, -3.1306, 0.2741]
-        success = self._execute_joint_motion_impl(home_joints, 4.0)
+        success = self._execute_joint_motion_impl(self.home_joints, 4.0)
         if success:
             self._publish_motion_result(GraspResult.SUCCESS, "Home position reached")
         else:

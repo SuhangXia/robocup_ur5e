@@ -12,12 +12,18 @@ from py_trees.common import Status
 
 import tf2_ros
 import tf2_geometry_msgs
-from geometry_msgs.msg import PointStamped
+from geometry_msgs.msg import PointStamped, PoseStamped
 import actionlib
-from moveit_msgs.msg import MoveGroupAction, MoveGroupGoal
 import actionlib_msgs.msg as action_msgs
 
-from common_msgs.msg import MotionCommand, GraspResult
+from common_msgs.msg import (
+    MotionCommand,
+    GraspResult,
+    PlanExecutePoseAction,
+    PlanExecutePoseGoal,
+    PlanExecutePoseResult,
+    PlanExecutePoseFeedback,
+)
 
 try:
     # TODO: add DetectedObjectArray to common_msgs when the perception interface is finalized.
@@ -191,8 +197,14 @@ class RequestGraspPoseBehavior(py_trees.behaviour.Behaviour):
         if is_test_mode():
             if not self.request_sent:
                 rospy.loginfo("[Brain] [Test] Mock grasp pose request complete")
+                mock_pose = PoseStamped()
+                mock_pose.header.frame_id = "base_link"
+                mock_pose.pose.position.x = 0.35
+                mock_pose.pose.position.y = -0.10
+                mock_pose.pose.position.z = 0.30
+                mock_pose.pose.orientation.w = 1.0
                 blackboard = py_trees.blackboard.Blackboard()
-                blackboard.set("target_grasp_pose", "mock_grasp_pose")
+                blackboard.set("target_grasp_pose", mock_pose)
                 self.request_sent = True
             return Status.SUCCESS
 
@@ -224,16 +236,25 @@ class ExecutePickAndPlaceBehavior(py_trees.behaviour.Behaviour):
         self.client = None
         self.goal_sent = False
         self.mock_done = False
+        self.last_feedback_message = None
         
     def setup(self, timeout=None):
         if is_test_mode():
             return True
-        self.client = actionlib.SimpleActionClient('/move_group', MoveGroupAction)
+        self.client = actionlib.SimpleActionClient('/path_planning/plan_execute_pose', PlanExecutePoseAction)
         return True
+
+    def _feedback_callback(self, feedback):
+        if feedback.message == self.last_feedback_message:
+            return
+        self.last_feedback_message = feedback.message
+        stage_name = "planning" if feedback.stage == PlanExecutePoseFeedback.PLANNING else "executing"
+        rospy.loginfo("[Brain] Path planning feedback (%s): %s", stage_name, feedback.message)
 
     def initialise(self):
         self.goal_sent = False
         self.mock_done = False
+        self.last_feedback_message = None
 
     def update(self):
         if is_test_mode():
@@ -244,18 +265,27 @@ class ExecutePickAndPlaceBehavior(py_trees.behaviour.Behaviour):
 
         # 初始化检查
         if not self.client.wait_for_server(rospy.Duration(0.1)):
+            rospy.loginfo_throttle(2.0, "[Brain] Waiting for path_planning action server...")
             return Status.RUNNING
 
         # 1. 如果还没发指令，发送指令
         if not self.goal_sent:
             blackboard = py_trees.blackboard.Blackboard()
             target_pose = blackboard.get("target_grasp_pose")
-            
-            goal = MoveGroupGoal()
-            # ... 填充 goal ...
-            
-            rospy.loginfo("[Brain] Sending Goal to MoveIt...")
-            self.client.send_goal(goal)
+
+            if target_pose is None:
+                rospy.loginfo_throttle(2.0, "[Brain] Waiting for target_grasp_pose...")
+                return Status.RUNNING
+            if not isinstance(target_pose, PoseStamped):
+                rospy.logerr("[Brain] target_grasp_pose is not a PoseStamped: %r", type(target_pose))
+                return Status.FAILURE
+
+            goal = PlanExecutePoseGoal()
+            goal.target_pose = target_pose
+            goal.position_only = rospy.get_param("~path_planning_position_only", False)
+
+            rospy.loginfo("[Brain] Sending target pose to path_planning action...")
+            self.client.send_goal(goal, feedback_cb=self._feedback_callback)
             self.goal_sent = True
             return Status.RUNNING
             
@@ -266,12 +296,24 @@ class ExecutePickAndPlaceBehavior(py_trees.behaviour.Behaviour):
             return Status.RUNNING # 机械臂正在动，树继续 Tick，不卡死！
             
         elif state == action_msgs.GoalStatus.SUCCEEDED:
-            rospy.loginfo("[Brain] Pick and Place SUCCESS!")
+            result = self.client.get_result()
             self.goal_sent = False # 重置状态，为下一次抓取做准备
-            return Status.SUCCESS
+            if result is not None and result.success:
+                blackboard = py_trees.blackboard.Blackboard()
+                blackboard.set("executed_trajectory", result.trajectory)
+                rospy.loginfo("[Brain] Pick and Place SUCCESS! %s", result.message)
+                return Status.SUCCESS
+            failure_message = result.message if result is not None else "path_planning action returned no result"
+            rospy.logerr("[Brain] Path planning action failed after SUCCEEDED state: %s", failure_message)
+            return Status.FAILURE
             
         else:
-            rospy.logerr(f"[Brain] MoveIt Failed with state: {state}")
+            result = self.client.get_result()
+            failure_message = result.message if result is not None else f"path_planning action failed with state {state}"
+            if result is not None and result.status == PlanExecutePoseResult.PREEMPTED:
+                rospy.logwarn("[Brain] Path planning action preempted: %s", failure_message)
+            else:
+                rospy.logerr("[Brain] Path planning action failed: %s", failure_message)
             self.goal_sent = False
             return Status.FAILURE
 

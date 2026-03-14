@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.0.2)
 project(path_planning)
 
 find_package(catkin REQUIRED COMPONENTS
+  actionlib
+  actionlib_msgs
   rospy
   std_msgs
   geometry_msgs
@@ -29,6 +31,8 @@ generate_messages(
 
 catkin_package(
   CATKIN_DEPENDS
+    actionlib
+    actionlib_msgs
     rospy
     std_msgs
     geometry_msgs
@@ -42,6 +46,7 @@ catkin_package(
 
 catkin_install_python(PROGRAMS
   nodes/aco_rrtstar_planner_node.py
+  nodes/PRM_Planner.py
   nodes/Planner_Scene.py
   nodes/test_aco_rrtstar.py
   nodes/demo_one_shot_planning.py

@@ -52,7 +52,7 @@ class PlanningSceneAdapter:
         self.robot = moveit_commander.RobotCommander()
 
         self.frame_id = rospy.get_param("~frame", "base_link")
-        self.ee_link = rospy.get_param("~ee_link", "wrist_3_link")
+        self.ee_link = rospy.get_param("~ee_link", "gripper_tip_link")
 
         self.touch_links = rospy.get_param(
             "~touch_links",

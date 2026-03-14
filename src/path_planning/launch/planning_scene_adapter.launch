@@ -1,7 +1,7 @@
 <?xml version="1.0"?>
 <launch>
   <arg name="frame" default="base_link" />
-  <arg name="ee_link" default="wrist_3_link" />
+  <arg name="ee_link" default="gripper_tip_link" />
   <arg name="pointcloud_topic" default="/camera/depth/points" />
   <arg name="motion_result_topic" default="/motion/result" />
   <arg name="planning_scene_command_topic" default="/brain/planning_scene_command" />

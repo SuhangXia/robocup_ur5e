@@ -9,6 +9,8 @@
 
   <buildtool_depend>catkin</buildtool_depend>
   
+  <depend>actionlib</depend>
+  <depend>actionlib_msgs</depend>
   <depend>rospy</depend>
   <depend>std_msgs</depend>
   <depend>geometry_msgs</depend>

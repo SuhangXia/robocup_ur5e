@@ -3,6 +3,7 @@ project(common_msgs)
 
 find_package(catkin REQUIRED COMPONENTS
   message_generation
+  actionlib_msgs
   std_msgs
   sensor_msgs
   geometry_msgs
@@ -22,9 +23,16 @@ add_message_files(
   PathPlanRequest.msg
 )
 
+add_action_files(
+  FILES
+  PlanExecutePose.action
+  ExecuteTrajectory.action
+)
+
 ## Generate message dependencies
 generate_messages(
   DEPENDENCIES
+  actionlib_msgs
   std_msgs
   sensor_msgs
   geometry_msgs
@@ -35,6 +43,7 @@ generate_messages(
 catkin_package(
   CATKIN_DEPENDS 
     message_runtime 
+    actionlib_msgs
     std_msgs 
     sensor_msgs 
     geometry_msgs

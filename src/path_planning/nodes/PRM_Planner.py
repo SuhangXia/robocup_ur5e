@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
+import copy
 import sys
 import os
+import threading
+import math
 import rospy
 import moveit_commander
+import actionlib
+import tf2_ros
 
-from geometry_msgs.msg import PoseStamped, Point
+from geometry_msgs.msg import PoseStamped, Point, TransformStamped
 from moveit_msgs.msg import PlanningScene, PlanningSceneComponents, AllowedCollisionEntry
 from moveit_msgs.msg import DisplayTrajectory
 from moveit_msgs.srv import GetStateValidity, GetStateValidityRequest
@@ -12,8 +17,19 @@ from moveit_msgs.srv import GetPositionFK, GetPositionFKRequest
 from moveit_msgs.srv import ApplyPlanningScene, ApplyPlanningSceneRequest, GetPlanningScene, GetPlanningSceneRequest
 from std_srvs.srv import Empty
 from std_srvs.srv import Trigger, TriggerResponse
-from common_msgs.msg import ObjectScore
+from std_msgs.msg import ColorRGBA
+from common_msgs.msg import (
+    ObjectScore,
+    ExecuteTrajectoryAction,
+    ExecuteTrajectoryGoal,
+    ExecuteTrajectoryResult,
+    PlanExecutePoseAction,
+    PlanExecutePoseResult,
+    PlanExecutePoseFeedback,
+)
+from tf.transformations import euler_from_quaternion, quaternion_from_euler
 from visualization_msgs.msg import Marker
+import actionlib_msgs.msg as action_msgs
 
 
 def publish_display_trajectory(robot, plan):
@@ -46,6 +62,45 @@ def extract_plan(plan_result):
     return False, robot_traj
 
 
+def rotate_vector_by_quaternion(quat, vector):
+    x = quat.x
+    y = quat.y
+    z = quat.z
+    w = quat.w
+    norm = (x * x + y * y + z * z + w * w) ** 0.5
+    if norm < 1e-9:
+        x, y, z, w = 0.0, 0.0, 0.0, 1.0
+    else:
+        x /= norm
+        y /= norm
+        z /= norm
+        w /= norm
+
+    vx = vector[0]
+    vy = vector[1]
+    vz = vector[2]
+
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+
+    rx = vx + w * tx + (y * tz - z * ty)
+    ry = vy + w * ty + (z * tx - x * tz)
+    rz = vz + w * tz + (x * ty - y * tx)
+    return rx, ry, rz
+
+
+def quaternion_to_rpy(quat):
+    x = quat.x
+    y = quat.y
+    z = quat.z
+    w = quat.w
+    norm = (x * x + y * y + z * z + w * w) ** 0.5
+    if norm < 1e-9:
+        return 0.0, 0.0, 0.0
+    return euler_from_quaternion((x / norm, y / norm, z / norm, w / norm))
+
+
 class PRMPlannerNode:
     def __init__(self):
         moveit_commander.roscpp_initialize(sys.argv)
@@ -55,7 +110,7 @@ class PRMPlannerNode:
         self.group_name = rospy.get_param("~group", "manipulator")
         self.planner_id = rospy.get_param("~planner", "PRMstar")
         self.frame_id = rospy.get_param("~frame", "base_link")
-        self.ee_link = rospy.get_param("~ee_link", "wrist_3_link")
+        self.ee_link = rospy.get_param("~ee_link", "gripper_tip_link")
 
         planning_time = rospy.get_param("~planning_time", 10.0)
         attempts = rospy.get_param("~attempts", 10)
@@ -69,14 +124,29 @@ class PRMPlannerNode:
         self.gripper_internal_collision_pairs = rospy.get_param(
             "~gripper_internal_collision_pairs",
             [
+                ["robotiq_coupler", "wrist_3_link"],
+                ["robotiq_coupler", "robotiq_85_base_link"],
                 ["robotiq_85_left_finger_tip_link", "robotiq_85_left_inner_knuckle_link"],
                 ["robotiq_85_right_finger_tip_link", "robotiq_85_right_inner_knuckle_link"],
+                ["robotiq_85_left_finger_link", "robotiq_85_left_finger_tip_link"],
+                ["robotiq_85_right_finger_link", "robotiq_85_right_finger_tip_link"],
+                ["robotiq_85_left_finger_link", "robotiq_85_left_knuckle_link"],
+                ["robotiq_85_right_finger_link", "robotiq_85_right_knuckle_link"],
+                ["robotiq_85_left_inner_knuckle_link", "robotiq_85_base_link"],
+                ["robotiq_85_right_inner_knuckle_link", "robotiq_85_base_link"],
+                ["robotiq_85_left_knuckle_link", "robotiq_85_base_link"],
+                ["robotiq_85_right_knuckle_link", "robotiq_85_base_link"],
             ],
         )
         self.goal_position_tolerance = rospy.get_param("~goal_position_tolerance", 0.01)
         self.goal_orientation_tolerance = rospy.get_param("~goal_orientation_tolerance", 0.05)
         self.goal_joint_tolerance = rospy.get_param("~goal_joint_tolerance", 0.01)
-        self.bin_position_only = rospy.get_param("~bin_position_only", True)
+        self.publish_target_tf = rospy.get_param("~publish_target_tf", True)
+        self.target_tf_frame = rospy.get_param("~target_tf_frame", "prm_target_pose")
+        self.target_tf_rate = float(rospy.get_param("~target_tf_rate", 10.0))
+        self.target_axis_length = float(rospy.get_param("~target_axis_length", 0.08))
+        self.target_axis_width = float(rospy.get_param("~target_axis_width", 0.006))
+        self.bin_position_only = rospy.get_param("~bin_position_only", False)
         self.use_object_score_target = rospy.get_param("~use_object_score_target", True)
         self.object_score_topic = rospy.get_param("~object_score_topic", "/perception/object_score")
         self.target_object_id = rospy.get_param("~target_object_id", -1)
@@ -94,6 +164,8 @@ class PRMPlannerNode:
             "~fallback_planners",
             ["RRTConnectkConfigDefault", "RRTstarkConfigDefault", "PRMkConfigDefault"],
         )
+        self.execute_max_velocity = float(rospy.get_param("~execute_max_velocity", 1.0))
+        self.execute_max_acceleration = float(rospy.get_param("~execute_max_acceleration", 1.0))
         self.latest_objects = {}
         self.selected_object = None
 
@@ -105,10 +177,26 @@ class PRMPlannerNode:
         self.apply_scene_srv = None
         self.get_scene_srv = None
         self.last_failure_detail = "none"
+        self._target_tf_lock = threading.Lock()
+        self._latest_target_pose = None
 
         self.path_marker_pub = rospy.Publisher("~ee_path_marker", Marker, queue_size=1, latch=True)
         self.target_marker_pub = rospy.Publisher("~target_marker", Marker, queue_size=1, latch=True)
+        self.target_pose_pub = rospy.Publisher("~target_pose", PoseStamped, queue_size=1, latch=True)
+        self.target_axis_pub = rospy.Publisher("~target_pose_axis", Marker, queue_size=1, latch=True)
         self.status_marker_pub = rospy.Publisher("~status_marker", Marker, queue_size=1, latch=True)
+        self.target_tf_broadcaster = tf2_ros.TransformBroadcaster() if self.publish_target_tf else None
+        self.target_tf_timer = None
+        self.motion_control_client = actionlib.SimpleActionClient(
+            "/motion_control/execute_trajectory",
+            ExecuteTrajectoryAction,
+        )
+        self.plan_execute_pose_server = actionlib.SimpleActionServer(
+            "/path_planning/plan_execute_pose",
+            PlanExecutePoseAction,
+            execute_cb=self._execute_pose_action_cb,
+            auto_start=False,
+        )
 
         self.group.set_pose_reference_frame(self.frame_id)
         self.group.set_planner_id(self.planner_id)
@@ -184,7 +272,171 @@ class PRMPlannerNode:
         if self.allow_gripper_internal_collisions:
             self._allow_gripper_internal_collisions()
 
+        if self.publish_target_tf and self.target_tf_rate > 0.0:
+            self.target_tf_timer = rospy.Timer(
+                rospy.Duration(1.0 / self.target_tf_rate),
+                self._target_tf_timer_cb,
+            )
+
+        self.plan_execute_pose_server.start()
         rospy.loginfo("[PRM] PRM planner node ready.")
+
+    def _publish_plan_execute_feedback(self, stage, message):
+        feedback = PlanExecutePoseFeedback()
+        feedback.stage = stage
+        feedback.message = message
+        self.plan_execute_pose_server.publish_feedback(feedback)
+
+    def _make_plan_execute_result(self, success, status, message, trajectory=None):
+        result = PlanExecutePoseResult()
+        result.success = success
+        result.status = status
+        result.message = message
+        if trajectory is not None:
+            result.trajectory = trajectory
+        return result
+
+    def _validate_plan_execute_goal(self, goal):
+        target_pose = goal.target_pose
+        if not target_pose.header.frame_id:
+            return False, "target_pose.header.frame_id is required"
+        if goal.position_only:
+            return True, ""
+
+        q = target_pose.pose.orientation
+        if q.x == 0.0 and q.y == 0.0 and q.z == 0.0 and q.w == 0.0:
+            return False, "target_pose orientation is invalid (zero quaternion)"
+        return True, ""
+
+    def _execute_pose_action_cb(self, goal):
+        is_valid, message = self._validate_plan_execute_goal(goal)
+        if not is_valid:
+            result = self._make_plan_execute_result(
+                False,
+                PlanExecutePoseResult.INVALID_GOAL,
+                message,
+            )
+            self.plan_execute_pose_server.set_aborted(result, message)
+            return
+
+        if self.plan_execute_pose_server.is_preempt_requested():
+            result = self._make_plan_execute_result(
+                False,
+                PlanExecutePoseResult.PREEMPTED,
+                "Path planning goal preempted before planning started",
+            )
+            self.plan_execute_pose_server.set_preempted(result, result.message)
+            return
+
+        self._publish_plan_execute_feedback(
+            PlanExecutePoseFeedback.PLANNING,
+            "Planning with MoveIt/PRM",
+        )
+        success, robot_traj = self.plan_to_pose(
+            goal.target_pose,
+            label="action_target",
+            position_only=goal.position_only,
+            execute_motion=False,
+        )
+
+        if self.plan_execute_pose_server.is_preempt_requested():
+            result = self._make_plan_execute_result(
+                False,
+                PlanExecutePoseResult.PREEMPTED,
+                "Path planning goal preempted after planning",
+                robot_traj.joint_trajectory if robot_traj is not None else None,
+            )
+            self.plan_execute_pose_server.set_preempted(result, result.message)
+            return
+
+        if not success or robot_traj is None or not hasattr(robot_traj, "joint_trajectory"):
+            result = self._make_plan_execute_result(
+                False,
+                PlanExecutePoseResult.PLANNING_FAILED,
+                f"Planning failed: {self.last_failure_detail}",
+                robot_traj.joint_trajectory if robot_traj is not None else None,
+            )
+            self.plan_execute_pose_server.set_aborted(result, result.message)
+            return
+
+        if not self.motion_control_client.wait_for_server(timeout=rospy.Duration(1.0)):
+            result = self._make_plan_execute_result(
+                False,
+                PlanExecutePoseResult.EXECUTION_FAILED,
+                "motion_control action server is unavailable",
+                robot_traj.joint_trajectory,
+            )
+            self.plan_execute_pose_server.set_aborted(result, result.message)
+            return
+
+        execute_goal = ExecuteTrajectoryGoal()
+        execute_goal.trajectory = robot_traj.joint_trajectory
+        execute_goal.max_velocity = self.execute_max_velocity
+        execute_goal.max_acceleration = self.execute_max_acceleration
+
+        self._publish_plan_execute_feedback(
+            PlanExecutePoseFeedback.EXECUTING,
+            "Executing trajectory via motion_control",
+        )
+        self.motion_control_client.send_goal(execute_goal)
+
+        while not rospy.is_shutdown():
+            if self.plan_execute_pose_server.is_preempt_requested():
+                self.motion_control_client.cancel_goal()
+                result = self._make_plan_execute_result(
+                    False,
+                    PlanExecutePoseResult.PREEMPTED,
+                    "Path planning goal preempted during execution",
+                    robot_traj.joint_trajectory,
+                )
+                self.plan_execute_pose_server.set_preempted(result, result.message)
+                return
+
+            if self.motion_control_client.wait_for_result(timeout=rospy.Duration(0.1)):
+                motion_result = self.motion_control_client.get_result()
+                motion_state = self.motion_control_client.get_state()
+
+                if motion_state == action_msgs.GoalStatus.SUCCEEDED and motion_result is not None and motion_result.success:
+                    result = self._make_plan_execute_result(
+                        True,
+                        PlanExecutePoseResult.SUCCEEDED,
+                        motion_result.message or "Trajectory executed successfully",
+                        robot_traj.joint_trajectory,
+                    )
+                    self.plan_execute_pose_server.set_succeeded(result, result.message)
+                    return
+
+                if motion_result is not None and motion_result.status == ExecuteTrajectoryResult.PREEMPTED:
+                    result = self._make_plan_execute_result(
+                        False,
+                        PlanExecutePoseResult.PREEMPTED,
+                        motion_result.message or "Execution preempted",
+                        robot_traj.joint_trajectory,
+                    )
+                    self.plan_execute_pose_server.set_preempted(result, result.message)
+                    return
+
+                failure_message = "Execution failed"
+                if motion_result is not None and motion_result.message:
+                    failure_message = motion_result.message
+                else:
+                    failure_message = f"Execution failed with motion_control state {motion_state}"
+                result = self._make_plan_execute_result(
+                    False,
+                    PlanExecutePoseResult.EXECUTION_FAILED,
+                    failure_message,
+                    robot_traj.joint_trajectory,
+                )
+                self.plan_execute_pose_server.set_aborted(result, result.message)
+                return
+
+        result = self._make_plan_execute_result(
+            False,
+            PlanExecutePoseResult.PREEMPTED,
+            "Path planning action interrupted",
+            robot_traj.joint_trajectory,
+        )
+        self.plan_execute_pose_server.set_preempted(result, result.message)
 
     def _ensure_state_validity_srv(self):
         if self.state_validity_srv is not None:
@@ -274,6 +526,34 @@ class PRMPlannerNode:
         except Exception:
             return False
 
+    def _update_target_tf(self, target_pose):
+        if not self.publish_target_tf:
+            return
+        with self._target_tf_lock:
+            self._latest_target_pose = copy.deepcopy(target_pose)
+        self._broadcast_target_tf()
+
+    def _broadcast_target_tf(self):
+        if not self.publish_target_tf or self.target_tf_broadcaster is None:
+            return
+        with self._target_tf_lock:
+            target_pose = copy.deepcopy(self._latest_target_pose)
+        if target_pose is None:
+            return
+
+        tf_msg = TransformStamped()
+        tf_msg.header.stamp = rospy.Time.now()
+        tf_msg.header.frame_id = target_pose.header.frame_id or self.frame_id
+        tf_msg.child_frame_id = self.target_tf_frame
+        tf_msg.transform.translation.x = target_pose.pose.position.x
+        tf_msg.transform.translation.y = target_pose.pose.position.y
+        tf_msg.transform.translation.z = target_pose.pose.position.z
+        tf_msg.transform.rotation = target_pose.pose.orientation
+        self.target_tf_broadcaster.sendTransform(tf_msg)
+
+    def _target_tf_timer_cb(self, _event):
+        self._broadcast_target_tf()
+
     def _start_state_validity_info(self):
         if not self._ensure_state_validity_srv():
             return True, "state validity service unavailable"
@@ -286,8 +566,15 @@ class PRMPlannerNode:
                 return True, "start state valid"
             if not resp.contacts:
                 return False, "start state invalid (collision contact list empty)"
-            c0 = resp.contacts[0]
-            detail = "start state in collision: %s <-> %s" % (c0.contact_body_1, c0.contact_body_2)
+            unique_pairs = []
+            seen_pairs = set()
+            for contact in resp.contacts:
+                pair = tuple(sorted((contact.contact_body_1, contact.contact_body_2)))
+                if pair in seen_pairs:
+                    continue
+                seen_pairs.add(pair)
+                unique_pairs.append("%s <-> %s" % pair)
+            detail = "start state in collision: %s" % "; ".join(unique_pairs[:8])
             return False, detail
         except Exception as exc:
             return True, "state validity check failed: %s" % str(exc)
@@ -335,6 +622,8 @@ class PRMPlannerNode:
         return points
 
     def _publish_plan_markers(self, ee_points, target_pose, success, label, status_text):
+        self.target_pose_pub.publish(target_pose)
+        self._update_target_tf(target_pose)
         if not self.publish_plan_markers:
             return
 
@@ -356,6 +645,39 @@ class PRMPlannerNode:
         target_marker.color.g = 1.0 if success else 0.2
         target_marker.color.b = 0.1
         self.target_marker_pub.publish(target_marker)
+
+        axis_marker = Marker()
+        axis_marker.header.frame_id = self.frame_id
+        axis_marker.header.stamp = now
+        axis_marker.ns = "prm_target_pose_axis"
+        axis_marker.id = 4
+        axis_marker.type = Marker.LINE_LIST
+        axis_marker.action = Marker.ADD
+        axis_marker.pose.orientation.w = 1.0
+        axis_marker.scale.x = self.target_axis_width
+        axis_marker.points = []
+        axis_marker.colors = []
+
+        origin = target_pose.pose.position
+        quat = target_pose.pose.orientation
+        axis_specs = [
+            ((self.target_axis_length, 0.0, 0.0), ColorRGBA(r=1.0, g=0.0, b=0.0, a=1.0)),
+            ((0.0, self.target_axis_length, 0.0), ColorRGBA(r=0.0, g=1.0, b=0.0, a=1.0)),
+            ((0.0, 0.0, self.target_axis_length), ColorRGBA(r=0.0, g=0.4, b=1.0, a=1.0)),
+        ]
+        for axis_vec, color in axis_specs:
+            dx, dy, dz = rotate_vector_by_quaternion(quat, axis_vec)
+            start = Point()
+            start.x = origin.x
+            start.y = origin.y
+            start.z = origin.z
+            end = Point()
+            end.x = origin.x + dx
+            end.y = origin.y + dy
+            end.z = origin.z + dz
+            axis_marker.points.extend([start, end])
+            axis_marker.colors.extend([color, color])
+        self.target_axis_pub.publish(axis_marker)
 
         path_marker = Marker()
         path_marker.header.frame_id = self.frame_id
@@ -453,16 +775,40 @@ class PRMPlannerNode:
         self.pregrasp_offset_z = rospy.get_param("~pregrasp_offset_z", 0.12)
         self.grasp_offset_z = rospy.get_param("~grasp_offset_z", 0.02)
 
-        # Safer defaults for drop zone (less stretched than previous values)
-        self.bin_x = rospy.get_param("~bin_x", 0.30)
-        self.bin_y = rospy.get_param("~bin_y", -0.25)
-        self.bin_z = rospy.get_param("~bin_z", 0.40)
+        # Default bin pose tuned for the current UR5e drop motion tests.
+        self.bin_x = rospy.get_param("~bin_x", 0.50)
+        self.bin_y = rospy.get_param("~bin_y", -0.30)
+        self.bin_z = rospy.get_param("~bin_z", 0.30)
+        self.bin_rx = rospy.get_param("~bin_rx", math.pi / 2.0)
+        self.bin_ry = rospy.get_param("~bin_ry", math.pi)
+        self.bin_rz = rospy.get_param("~bin_rz", 0.0)
 
-        # Safer default test orientation: identity quaternion
-        self.qx = rospy.get_param("~qx", 0.0)
-        self.qy = rospy.get_param("~qy", 0.0)
-        self.qz = rospy.get_param("~qz", 0.0)
-        self.qw = rospy.get_param("~qw", 1.0)
+        # Prefer roll/pitch/yaw params for human-facing workflows. Legacy qx/qy/qz/qw
+        # are still accepted as fallback so older scripts do not break.
+        rx = rospy.get_param("~rx", None)
+        ry = rospy.get_param("~ry", None)
+        rz = rospy.get_param("~rz", None)
+        if rx is None or ry is None or rz is None:
+            qx = rospy.get_param("~qx", None)
+            qy = rospy.get_param("~qy", None)
+            qz = rospy.get_param("~qz", None)
+            qw = rospy.get_param("~qw", None)
+            if None not in (qx, qy, qz, qw):
+                class _Quat:
+                    pass
+
+                quat = _Quat()
+                quat.x = float(qx)
+                quat.y = float(qy)
+                quat.z = float(qz)
+                quat.w = float(qw)
+                self.rx, self.ry, self.rz = quaternion_to_rpy(quat)
+            else:
+                self.rx, self.ry, self.rz = 0.0, 0.0, 0.0
+        else:
+            self.rx = float(rx)
+            self.ry = float(ry)
+            self.rz = float(rz)
         self.use_object_score_target = rospy.get_param("~use_object_score_target", self.use_object_score_target)
         self.target_object_id = rospy.get_param("~target_object_id", self.target_object_id)
         self.target_label = rospy.get_param("~target_label", self.target_label)
@@ -473,25 +819,31 @@ class PRMPlannerNode:
         self.stage3_x = rospy.get_param("~stage3_x", self.stage3_x)
         self.stage3_y = rospy.get_param("~stage3_y", self.stage3_y)
         self.stage3_z = rospy.get_param("~stage3_z", self.stage3_z)
+        self.bin_rx = rospy.get_param("~bin_rx", self.bin_rx)
+        self.bin_ry = rospy.get_param("~bin_ry", self.bin_ry)
+        self.bin_rz = rospy.get_param("~bin_rz", self.bin_rz)
 
         rospy.loginfo(
             "[PRM] Runtime params:"
             " target=(%.3f, %.3f, %.3f)"
             " pregrasp_offset_z=%.3f grasp_offset_z=%.3f"
+            " target_rpy=(%.3f, %.3f, %.3f)"
             " bin=(%.3f, %.3f, %.3f)"
-            " q=(%.3f, %.3f, %.3f, %.3f)",
+            " bin_rpy=(%.3f, %.3f, %.3f)",
             self.target_x,
             self.target_y,
             self.target_z,
             self.pregrasp_offset_z,
             self.grasp_offset_z,
+            self.rx,
+            self.ry,
+            self.rz,
             self.bin_x,
             self.bin_y,
             self.bin_z,
-            self.qx,
-            self.qy,
-            self.qz,
-            self.qw,
+            self.bin_rx,
+            self.bin_ry,
+            self.bin_rz,
         )
 
     def _on_object_score(self, msg):
@@ -559,17 +911,24 @@ class PRMPlannerNode:
         candidates.sort(key=lambda o: (-float(getattr(o, "total_score", 0.0)), int(o.object_id)))
         return self._object_xyz_from_msg(candidates[0])
 
-    def _make_pose(self, x, y, z):
+    def _make_pose(self, x, y, z, rx=None, ry=None, rz=None):
         target = PoseStamped()
         target.header.frame_id = self.frame_id
         target.header.stamp = rospy.Time.now()
         target.pose.position.x = x
         target.pose.position.y = y
         target.pose.position.z = z
-        target.pose.orientation.x = self.qx
-        target.pose.orientation.y = self.qy
-        target.pose.orientation.z = self.qz
-        target.pose.orientation.w = self.qw
+        if rx is None:
+            rx = self.rx
+        if ry is None:
+            ry = self.ry
+        if rz is None:
+            rz = self.rz
+        qx, qy, qz, qw = quaternion_from_euler(rx, ry, rz)
+        target.pose.orientation.x = qx
+        target.pose.orientation.y = qy
+        target.pose.orientation.z = qz
+        target.pose.orientation.w = qw
         return target
 
     def _plan_once(self):
@@ -592,8 +951,9 @@ class PRMPlannerNode:
                 rospy.logwarn("[PRM] Planner %s raised exception: %s", planner, exc)
         return False, None
 
-    def plan_to_pose(self, pose_stamped, label="target", position_only=False):
+    def plan_to_pose(self, pose_stamped, label="target", position_only=False, execute_motion=None):
         self.last_failure_detail = "none"
+        should_execute_motion = self.execute_motion if execute_motion is None else execute_motion
         if self.allow_gripper_internal_collisions:
             self._allow_gripper_internal_collisions()
         if self.clear_octomap_before_plan:
@@ -604,6 +964,7 @@ class PRMPlannerNode:
         if not valid_start:
             rospy.logwarn("[PRM] Pre-check for %s: %s", label, start_detail)
         if position_only:
+            rospy.logwarn("[PRM] %s is using position_only=True, so orientation will not be enforced.", label)
             self.group.set_position_target(
                 [
                     pose_stamped.pose.position.x,
@@ -613,19 +974,19 @@ class PRMPlannerNode:
                 self.ee_link,
             )
         else:
-            self.group.set_pose_target(pose_stamped)
+            self.group.set_pose_target(pose_stamped, self.ee_link)
 
+        rx, ry, rz = quaternion_to_rpy(pose_stamped.pose.orientation)
         rospy.loginfo(
-            "[PRM] Planning to %s: frame=%s pos=(%.3f, %.3f, %.3f) quat=(%.3f, %.3f, %.3f, %.3f) position_only=%s",
+            "[PRM] Planning to %s: frame=%s pos=(%.3f, %.3f, %.3f) rpy=(%.3f, %.3f, %.3f) position_only=%s",
             label,
             pose_stamped.header.frame_id,
             pose_stamped.pose.position.x,
             pose_stamped.pose.position.y,
             pose_stamped.pose.position.z,
-            pose_stamped.pose.orientation.x,
-            pose_stamped.pose.orientation.y,
-            pose_stamped.pose.orientation.z,
-            pose_stamped.pose.orientation.w,
+            rx,
+            ry,
+            rz,
             str(position_only),
         )
 
@@ -655,7 +1016,7 @@ class PRMPlannerNode:
                         self.ee_link,
                     )
                 else:
-                    self.group.set_pose_target(pose_stamped)
+                    self.group.set_pose_target(pose_stamped, self.ee_link)
                 try:
                     success, robot_traj = self._plan_with_fallbacks()
                 except Exception:
@@ -712,7 +1073,7 @@ class PRMPlannerNode:
         self._publish_plan_markers(ee_points, pose_stamped, True, label, "planned")
         self._save_plan_plot(ee_points, pose_stamped, True, label, "planned")
 
-        if self.execute_motion:
+        if should_execute_motion:
             rospy.loginfo("[PRM] Executing trajectory to %s...", label)
             ok = self.group.execute(robot_traj, wait=True)
             self.group.stop()
@@ -786,7 +1147,7 @@ class PRMPlannerNode:
                 return self.plan_to_pose(pose, label="stage3_object_full_pose", position_only=False)
             return ok, traj
 
-        pose = self._make_pose(self.bin_x, self.bin_y, self.bin_z)
+        pose = self._make_pose(self.bin_x, self.bin_y, self.bin_z, self.bin_rx, self.bin_ry, self.bin_rz)
         ok, traj = self.plan_to_pose(pose, label="bin", position_only=self.bin_position_only)
         if not ok and self.bin_position_only:
             rospy.logwarn("[PRM] Bin position-only planning failed, retrying with full pose target.")
