@@ -10,6 +10,12 @@
   <arg name="clear_octomap_before_plan" default="true" />
   <arg name="clear_octomap_on_failure" default="true" />
   <arg name="save_plot" default="false" />
+  <arg name="cartesian_path" default="false" />
+  <arg name="cartesian_eef_step" default="0.01" />
+  <arg name="cartesian_jump_threshold" default="0.0" />
+  <arg name="cartesian_min_fraction" default="0.995" />
+  <arg name="cartesian_avoid_collisions" default="true" />
+  <arg name="cartesian_fallback_to_joint_plan" default="false" />
 
   <node name="prm_planner_node" pkg="path_planning" type="PRM_Planner.py" output="screen">
     <param name="execute" value="$(arg execute)" />
@@ -22,5 +28,11 @@
     <param name="clear_octomap_before_plan" value="$(arg clear_octomap_before_plan)" />
     <param name="clear_octomap_on_failure" value="$(arg clear_octomap_on_failure)" />
     <param name="save_plan_plot" value="$(arg save_plot)" />
+    <param name="cartesian_path" value="$(arg cartesian_path)" />
+    <param name="cartesian_eef_step" value="$(arg cartesian_eef_step)" />
+    <param name="cartesian_jump_threshold" value="$(arg cartesian_jump_threshold)" />
+    <param name="cartesian_min_fraction" value="$(arg cartesian_min_fraction)" />
+    <param name="cartesian_avoid_collisions" value="$(arg cartesian_avoid_collisions)" />
+    <param name="cartesian_fallback_to_joint_plan" value="$(arg cartesian_fallback_to_joint_plan)" />
   </node>
 </launch>

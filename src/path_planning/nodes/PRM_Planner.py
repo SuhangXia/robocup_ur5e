@@ -120,6 +120,12 @@ class PRMPlannerNode:
         self.publish_plan_markers = rospy.get_param("~publish_plan_markers", True)
         self.save_plan_plot = rospy.get_param("~save_plan_plot", True)
         self.plan_plot_path = rospy.get_param("~plan_plot_path", "/tmp/prm_plan_plot.png")
+        self.cartesian_path = rospy.get_param("~cartesian_path", False)
+        self.cartesian_eef_step = float(rospy.get_param("~cartesian_eef_step", 0.01))
+        self.cartesian_jump_threshold = float(rospy.get_param("~cartesian_jump_threshold", 0.0))
+        self.cartesian_min_fraction = float(rospy.get_param("~cartesian_min_fraction", 0.995))
+        self.cartesian_avoid_collisions = rospy.get_param("~cartesian_avoid_collisions", True)
+        self.cartesian_fallback_to_joint_plan = rospy.get_param("~cartesian_fallback_to_joint_plan", False)
         self.allow_gripper_internal_collisions = rospy.get_param("~allow_gripper_internal_collisions", True)
         self.gripper_internal_collision_pairs = rospy.get_param(
             "~gripper_internal_collision_pairs",
@@ -235,6 +241,16 @@ class PRMPlannerNode:
             str(self.publish_plan_markers),
             str(self.save_plan_plot),
             self.plan_plot_path,
+        )
+        rospy.loginfo(
+            "[PRM] Cartesian mode: enabled=%s eef_step=%.4f jump_threshold=%.4f"
+            " min_fraction=%.3f avoid_collisions=%s fallback_to_joint=%s",
+            str(self.cartesian_path),
+            self.cartesian_eef_step,
+            self.cartesian_jump_threshold,
+            self.cartesian_min_fraction,
+            str(self.cartesian_avoid_collisions),
+            str(self.cartesian_fallback_to_joint_plan),
         )
         rospy.loginfo(
             "[PRM] ACM internal gripper collisions allowed=%s",
@@ -936,6 +952,40 @@ class PRMPlannerNode:
         success, robot_traj = extract_plan(plan_result)
         return success, robot_traj
 
+    def _retime_trajectory(self, robot_traj):
+        if robot_traj is None or not hasattr(robot_traj, "joint_trajectory"):
+            return robot_traj
+        if not hasattr(self.group, "retime_trajectory"):
+            return robot_traj
+
+        vel = max(1e-3, min(1.0, float(self.execute_max_velocity)))
+        acc = max(1e-3, min(1.0, float(self.execute_max_acceleration)))
+        try:
+            retimed = self.group.retime_trajectory(
+                self.robot.get_current_state(),
+                robot_traj,
+                velocity_scaling_factor=vel,
+                acceleration_scaling_factor=acc,
+            )
+        except TypeError:
+            try:
+                retimed = self.group.retime_trajectory(
+                    self.robot.get_current_state(),
+                    robot_traj,
+                    vel,
+                    acc,
+                )
+            except Exception as exc:
+                rospy.logwarn("[PRM] Failed to retime trajectory: %s", exc)
+                return robot_traj
+        except Exception as exc:
+            rospy.logwarn("[PRM] Failed to retime trajectory: %s", exc)
+            return robot_traj
+
+        if hasattr(retimed, "joint_trajectory") and len(retimed.joint_trajectory.points) > 0:
+            return retimed
+        return robot_traj
+
     def _plan_with_fallbacks(self):
         planner_order = [self.planner_id] + [p for p in self.fallback_planners if p != self.planner_id]
         for planner in planner_order:
@@ -951,6 +1001,115 @@ class PRMPlannerNode:
                 rospy.logwarn("[PRM] Planner %s raised exception: %s", planner, exc)
         return False, None
 
+    def _plan_joint_target(self, pose_stamped, position_only):
+        if position_only:
+            rospy.logwarn("[PRM] Joint planning with position_only=True; orientation will not be enforced.")
+            self.group.set_position_target(
+                [
+                    pose_stamped.pose.position.x,
+                    pose_stamped.pose.position.y,
+                    pose_stamped.pose.position.z,
+                ],
+                self.ee_link,
+            )
+        else:
+            self.group.set_pose_target(pose_stamped, self.ee_link)
+
+        try:
+            return self._plan_with_fallbacks()
+        finally:
+            self.group.clear_pose_targets()
+            self.group.clear_path_constraints()
+
+    def _plan_cartesian_target(self, pose_stamped, label, position_only):
+        if pose_stamped.header.frame_id and pose_stamped.header.frame_id != self.frame_id:
+            self.last_failure_detail = (
+                "cartesian path requires target_pose.header.frame_id=%s (got %s)"
+                % (self.frame_id, pose_stamped.header.frame_id)
+            )
+            rospy.logerr("[PRM] %s", self.last_failure_detail)
+            return False, None
+
+        waypoint = copy.deepcopy(pose_stamped.pose)
+        if position_only:
+            try:
+                current_pose = self.group.get_current_pose(self.ee_link).pose
+                waypoint.orientation = copy.deepcopy(current_pose.orientation)
+                rospy.loginfo("[PRM] Cartesian path to %s will preserve current EE orientation.", label)
+            except Exception as exc:
+                self.last_failure_detail = "failed to read current EE pose for cartesian planning: %s" % exc
+                rospy.logerr("[PRM] %s", self.last_failure_detail)
+                return False, None
+
+        if abs(self.cartesian_jump_threshold) > 1e-9:
+            rospy.logwarn(
+                "[PRM] cartesian_jump_threshold=%.4f requested, but this MoveIt Python wrapper"
+                " does not expose jump-threshold control; ignoring it.",
+                self.cartesian_jump_threshold,
+            )
+
+        try:
+            plan_result = self.group.compute_cartesian_path(
+                [waypoint],
+                self.cartesian_eef_step,
+                self.cartesian_avoid_collisions,
+            )
+        except Exception as exc:
+            self.last_failure_detail = "cartesian planner raised exception: %s" % exc
+            rospy.logerr("[PRM] %s", self.last_failure_detail)
+            return False, None
+
+        robot_traj = None
+        fraction = 0.0
+        if isinstance(plan_result, tuple) and len(plan_result) >= 2:
+            robot_traj = plan_result[0]
+            fraction = float(plan_result[1])
+        else:
+            robot_traj = plan_result
+            fraction = 1.0
+
+        if robot_traj is None or not hasattr(robot_traj, "joint_trajectory"):
+            self.last_failure_detail = "cartesian path returned no trajectory"
+            rospy.logerr("[PRM] %s", self.last_failure_detail)
+            return False, None
+
+        if len(robot_traj.joint_trajectory.points) == 0:
+            self.last_failure_detail = "cartesian path returned 0 trajectory points"
+            rospy.logerr("[PRM] %s", self.last_failure_detail)
+            return False, robot_traj
+
+        if fraction + 1e-6 < self.cartesian_min_fraction:
+            self.last_failure_detail = (
+                "cartesian path incomplete (fraction=%.3f < %.3f)"
+                % (fraction, self.cartesian_min_fraction)
+            )
+            rospy.logwarn("[PRM] %s", self.last_failure_detail)
+            return False, robot_traj
+
+        robot_traj = self._retime_trajectory(robot_traj)
+        pts = robot_traj.joint_trajectory.points
+        rospy.loginfo(
+            "[PRM] Cartesian path to %s found. fraction=%.3f points=%d duration=%.2fs",
+            label,
+            fraction,
+            len(pts),
+            pts[-1].time_from_start.to_sec(),
+        )
+        return True, robot_traj
+
+    def _plan_target(self, pose_stamped, label, position_only):
+        if self.cartesian_path:
+            success, robot_traj = self._plan_cartesian_target(pose_stamped, label, position_only)
+            if success or not self.cartesian_fallback_to_joint_plan:
+                return success, robot_traj
+            rospy.logwarn(
+                "[PRM] Cartesian planning to %s failed (%s). Falling back to planner-based path.",
+                label,
+                self.last_failure_detail,
+            )
+
+        return self._plan_joint_target(pose_stamped, position_only)
+
     def plan_to_pose(self, pose_stamped, label="target", position_only=False, execute_motion=None):
         self.last_failure_detail = "none"
         should_execute_motion = self.execute_motion if execute_motion is None else execute_motion
@@ -963,18 +1122,6 @@ class PRMPlannerNode:
         valid_start, start_detail = self._start_state_validity_info()
         if not valid_start:
             rospy.logwarn("[PRM] Pre-check for %s: %s", label, start_detail)
-        if position_only:
-            rospy.logwarn("[PRM] %s is using position_only=True, so orientation will not be enforced.", label)
-            self.group.set_position_target(
-                [
-                    pose_stamped.pose.position.x,
-                    pose_stamped.pose.position.y,
-                    pose_stamped.pose.position.z,
-                ],
-                self.ee_link,
-            )
-        else:
-            self.group.set_pose_target(pose_stamped, self.ee_link)
 
         rx, ry, rz = quaternion_to_rpy(pose_stamped.pose.orientation)
         rospy.loginfo(
@@ -989,63 +1136,36 @@ class PRMPlannerNode:
             rz,
             str(position_only),
         )
+        if self.cartesian_path:
+            rospy.loginfo("[PRM] %s is using cartesian_path=True for straight-line EE motion.", label)
 
         try:
-            success, robot_traj = self._plan_with_fallbacks()
+            success, robot_traj = self._plan_target(pose_stamped, label, position_only)
         except Exception as exc:
-            self.group.clear_pose_targets()
-            self.group.clear_path_constraints()
             rospy.logerr("[PRM] Exception during planning to %s: %s", label, exc)
             return False, None
-
-        self.group.clear_pose_targets()
-        self.group.clear_path_constraints()
 
         if not success:
             if self.clear_octomap_on_failure:
                 rospy.logwarn("[PRM] First attempt failed, clearing octomap and retrying once.")
                 self._clear_octomap()
                 self.group.set_start_state_to_current_state()
-                if position_only:
-                    self.group.set_position_target(
-                        [
-                            pose_stamped.pose.position.x,
-                            pose_stamped.pose.position.y,
-                            pose_stamped.pose.position.z,
-                        ],
-                        self.ee_link,
-                    )
-                else:
-                    self.group.set_pose_target(pose_stamped, self.ee_link)
                 try:
-                    success, robot_traj = self._plan_with_fallbacks()
+                    success, robot_traj = self._plan_target(pose_stamped, label, position_only)
                 except Exception:
                     success, robot_traj = False, None
-                self.group.clear_pose_targets()
-                self.group.clear_path_constraints()
 
-                if success and robot_traj is not None and hasattr(robot_traj, "joint_trajectory") \
-                        and len(robot_traj.joint_trajectory.points) > 0:
-                    pts = robot_traj.joint_trajectory.points
-                    rospy.loginfo(
-                        "[PRM] Path to %s found after octomap retry. points=%d duration=%.2fs",
-                        label,
-                        len(pts),
-                        pts[-1].time_from_start.to_sec(),
-                    )
-                    publish_display_trajectory(self.robot, robot_traj)
-                    return True, robot_traj
-
-            valid_after, after_detail = self._start_state_validity_info()
-            if not valid_after:
-                self.last_failure_detail = after_detail
-            else:
-                self.last_failure_detail = "planner returned success=False (no collision-free path found)"
-            self._publish_plan_markers([], pose_stamped, False, label, self.last_failure_detail)
-            self._save_plan_plot([], pose_stamped, False, label, self.last_failure_detail)
-            rospy.logerr("[PRM] Planning to %s failed: MoveIt returned success=False", label)
-            rospy.logerr("[PRM] Failure detail: %s", self.last_failure_detail)
-            return False, None
+            if not success:
+                valid_after, after_detail = self._start_state_validity_info()
+                if not valid_after:
+                    self.last_failure_detail = after_detail
+                elif not self.last_failure_detail or self.last_failure_detail == "none":
+                    self.last_failure_detail = "planner returned success=False (no collision-free path found)"
+                self._publish_plan_markers([], pose_stamped, False, label, self.last_failure_detail)
+                self._save_plan_plot([], pose_stamped, False, label, self.last_failure_detail)
+                rospy.logerr("[PRM] Planning to %s failed: MoveIt returned success=False", label)
+                rospy.logerr("[PRM] Failure detail: %s", self.last_failure_detail)
+                return False, None
 
         if robot_traj is None:
             rospy.logerr("[PRM] Planning to %s failed: robot_traj is None", label)
